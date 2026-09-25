@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YOLO 智能标注工具</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div id="app">
+        <!-- ===== 顶部工具栏 ===== -->
+        <header id="toolbar">
+            <div class="toolbar-left">
+                <h1 class="logo">YOLO 标注工具</h1>
+            </div>
+            <div class="toolbar-center">
+                <!-- 模型选择 -->
+                <div class="tool-group">
+                    <label>模型:</label>
+                    <select id="modelSelect">
+                        <option value="">-- 请先加载模型 --</option>
+                    </select>
+                    <button id="loadModelBtn" class="btn btn-primary btn-sm">加载模型</button>
+                </div>
+
+                <!-- 参数调节 -->
+                <div class="tool-group">
+                    <label>置信度:
+                        <input type="range" id="confidenceSlider" min="0.05" max="0.95" step="0.05" value="0.50">
+                        <span id="confidenceVal">0.50</span>
+                    </label>
+                </div>
+                <div class="tool-group">
+                    <label>IoU:
+                        <input type="range" id="iouSlider" min="0.1" max="0.9" step="0.05" value="0.45">
+                        <span id="iouVal">0.45</span>
+                    </label>
+                </div>
+
+                <!-- 操作按钮 -->
+                <div class="tool-group">
+                    <button id="uploadBtn" class="btn btn-success btn-sm">上传图片</button>
+                    <button id="batchAnnotateBtn" class="btn btn-primary btn-sm">批量标注</button>
+                    <button id="exportBtn" class="btn btn-warning btn-sm">导出</button>
+                </div>
+            </div>
+            <div class="toolbar-right">
+                <span id="progressLabel">未加载图片</span>
+                <button id="shutdownBtn" class="btn btn-danger btn-sm" title="关闭服务器">关闭服务</button>
+            </div>
+        </header>
+
+        <!-- ===== 主内容区 ===== -->
+        <div id="main-content">
+            <!-- 左侧：图片展示区 -->
+            <div id="image-area">
+                <div id="image-container">
+                    <canvas id="imageCanvas"></canvas>
+                    <div id="no-image-hint" class="hidden"></div>
+                </div>
+                <!-- 检测信息 -->
+                <div id="detection-info">
+                    <span id="currentImageName">未选择图片</span>
+                    <span id="detectionCount"></span>
+                </div>
+            </div>
+
+            <!-- 右侧：图片列表（类似 LabelMe 样式） -->
+            <aside id="sidebar">
+                <div class="sidebar-header">
+                    <h3>图片列表</h3>
+                    <div class="sidebar-actions">
+                        <span id="listCount">0 张</span>
+                        <button id="clearAllBtn" class="btn btn-danger btn-xs" title="清除所有图片">清除</button>
+                    </div>
+                </div>
+                <div id="image-list">
+                    <!-- 动态生成图片缩略图列表 -->
+                </div>
+            </aside>
+        </div>
+
+        <!-- ===== 批量标注进度弹窗 ===== -->
+        <div id="batch-progress-overlay" class="hidden">
+            <div id="batch-progress-box">
+                <h3>批量标注中...</h3>
+                <div class="progress-bar">
+                    <div id="progress-fill"></div>
+                </div>
+                <p id="progress-text">已标注 <span id="doneCount">0</span> 张，剩余 <span id="remainCount">0</span> 张</p>
+                <button id="cancelBatchBtn" class="btn btn-danger">取消</button>
+            </div>
+        </div>
+
+        <!-- ===== 导出格式选择弹窗 ===== -->
+        <div id="export-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>选择导出格式</h3>
+                <div class="export-options">
+                    <button class="export-btn" data-format="yolo_txt">YOLO TXT</button>
+                    <button class="export-btn" data-format="yolo_json">YOLO JSON</button>
+                    <button class="export-btn" data-format="coco_json">COCO JSON</button>
+                    <button class="export-btn" data-format="pascal_voc">Pascal VOC</button>
+                </div>
+                <button id="closeExportModal" class="btn btn-secondary">取消</button>
+            </div>
+        </div>
+
+        <!-- ===== 隐藏的文件上传输入 ===== -->
+        <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png" style="display:none">
+        <input type="file" id="modelFileInput" accept=".pt" style="display:none">
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
