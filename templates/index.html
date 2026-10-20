@@ -7,110 +7,188 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-    <div id="app">
-        <!-- ===== 顶部工具栏 ===== -->
-        <header id="toolbar">
-            <div class="toolbar-left">
-                <h1 class="logo">YOLO 标注工具</h1>
-            </div>
-            <div class="toolbar-center">
-                <!-- 模型选择 -->
-                <div class="tool-group">
-                    <label>模型:</label>
-                    <select id="modelSelect">
-                        <option value="">-- 请先加载模型 --</option>
-                    </select>
-                    <button id="loadModelBtn" class="btn btn-primary btn-sm">加载模型</button>
-                </div>
-
-                <!-- 参数调节 -->
-                <div class="tool-group">
-                    <label>置信度:
-                        <input type="range" id="confidenceSlider" min="0.05" max="0.95" step="0.05" value="0.50">
-                        <span id="confidenceVal">0.50</span>
-                    </label>
-                </div>
-                <div class="tool-group">
-                    <label>IoU:
-                        <input type="range" id="iouSlider" min="0.1" max="0.9" step="0.05" value="0.45">
-                        <span id="iouVal">0.45</span>
-                    </label>
-                </div>
-
-                <!-- 操作按钮 -->
-                <div class="tool-group">
-                    <button id="uploadBtn" class="btn btn-success btn-sm">上传图片</button>
-                    <button id="batchAnnotateBtn" class="btn btn-primary btn-sm">批量标注</button>
-                    <button id="exportBtn" class="btn btn-warning btn-sm">导出</button>
-                </div>
-            </div>
-            <div class="toolbar-right">
-                <span id="progressLabel">未加载图片</span>
-                <button id="shutdownBtn" class="btn btn-danger btn-sm" title="关闭服务器">关闭服务</button>
-            </div>
-        </header>
-
-        <!-- ===== 主内容区 ===== -->
-        <div id="main-content">
-            <!-- 左侧：图片展示区 -->
-            <div id="image-area">
-                <div id="image-container">
-                    <canvas id="imageCanvas"></canvas>
-                    <div id="no-image-hint" class="hidden"></div>
-                </div>
-                <!-- 检测信息 -->
-                <div id="detection-info">
-                    <span id="currentImageName">未选择图片</span>
-                    <span id="detectionCount"></span>
-                </div>
-            </div>
-
-            <!-- 右侧：图片列表（类似 LabelMe 样式） -->
-            <aside id="sidebar">
-                <div class="sidebar-header">
-                    <h3>图片列表</h3>
-                    <div class="sidebar-actions">
-                        <span id="listCount">0 张</span>
-                        <button id="clearAllBtn" class="btn btn-danger btn-xs" title="清除所有图片">清除</button>
-                    </div>
-                </div>
-                <div id="image-list">
-                    <!-- 动态生成图片缩略图列表 -->
-                </div>
-            </aside>
-        </div>
-
-        <!-- ===== 批量标注进度弹窗 ===== -->
-        <div id="batch-progress-overlay" class="hidden">
-            <div id="batch-progress-box">
-                <h3>批量标注中...</h3>
-                <div class="progress-bar">
-                    <div id="progress-fill"></div>
-                </div>
-                <p id="progress-text">已标注 <span id="doneCount">0</span> 张，剩余 <span id="remainCount">0</span> 张</p>
-                <button id="cancelBatchBtn" class="btn btn-danger">取消</button>
+<div id="app">
+    <header id="toolbar">
+        <div class="brand">
+            <span class="brand-mark">Y</span>
+            <div class="brand-text">
+                <h1>YOLO 智能标注</h1>
+                <span class="version">v{{ version }}</span>
             </div>
         </div>
 
-        <!-- ===== 导出格式选择弹窗 ===== -->
-        <div id="export-modal" class="modal hidden">
-            <div class="modal-content">
-                <h3>选择导出格式</h3>
-                <div class="export-options">
-                    <button class="export-btn" data-format="yolo_txt">YOLO TXT</button>
-                    <button class="export-btn" data-format="yolo_json">YOLO JSON</button>
-                    <button class="export-btn" data-format="coco_json">COCO JSON</button>
-                    <button class="export-btn" data-format="pascal_voc">Pascal VOC</button>
-                </div>
-                <button id="closeExportModal" class="btn btn-secondary">取消</button>
-            </div>
+        <div class="tool-group">
+            <select id="modelSelect" aria-label="选择模型"></select>
+            <button id="loadModelBtn" class="btn btn-primary">加载模型</button>
         </div>
 
-        <!-- ===== 隐藏的文件上传输入 ===== -->
-        <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png" style="display:none">
-        <input type="file" id="modelFileInput" accept=".pt" style="display:none">
+        <div class="tool-group sliders">
+            <label class="slider">
+                <span>置信度</span>
+                <input type="range" id="confidenceSlider" min="0.05" max="0.95" step="0.05" value="0.35">
+                <b id="confidenceVal">0.35</b>
+            </label>
+            <label class="slider">
+                <span>IoU</span>
+                <input type="range" id="iouSlider" min="0.1" max="0.9" step="0.05" value="0.45">
+                <b id="iouVal">0.45</b>
+            </label>
+        </div>
+
+        <div class="tool-group">
+            <button id="uploadBtn" class="btn">上传图片</button>
+            <button id="annotateCurrentBtn" class="btn">标注当前图</button>
+            <button id="batchBtn" class="btn">批量标注</button>
+            <label class="mini-check" title="已标注的图片也重新跑一遍模型">
+                <input type="checkbox" id="reannotate"> 重标全部
+            </label>
+            <button id="exportBtn" class="btn">导出</button>
+        </div>
+
+        <div class="spacer"></div>
+
+        <div class="tool-group status-group">
+            <span id="modelBadge" class="badge">未加载模型</span>
+            <span id="progressLabel" class="badge">未加载图片</span>
+            <button id="helpBtn" class="icon-btn" title="快捷键（H）">?</button>
+            <button id="shutdownBtn" class="btn btn-ghost" title="关闭本地服务">退出</button>
+        </div>
+    </header>
+
+    <main id="main">
+        <section id="stage">
+            <div id="viewport">
+                <canvas id="canvas"></canvas>
+                <div id="emptyHint" class="empty-hint">
+                    <strong>把图片拖进来</strong>
+                    <span>或点上方「上传图片」，支持 jpg / png / bmp / webp</span>
+                </div>
+                <div id="dropMask" class="drop-mask">松开鼠标即可上传</div>
+            </div>
+            <footer id="statusbar">
+                <span id="fileName">未选择图片</span>
+                <span class="dot">·</span>
+                <span id="boxCount">0 个框</span>
+                <span class="dot">·</span>
+                <span id="zoomLabel">100%</span>
+                <span class="spacer"></span>
+                <span class="hint">拖空白处画框 · 拖动框移动 · 空格或中键平移 · 滚轮缩放</span>
+                <span id="saveState" class="save-state">—</span>
+            </footer>
+        </section>
+
+        <aside id="sidebar">
+            <nav class="tabs">
+                <button class="tab active" data-panel="images">图片</button>
+                <button class="tab" data-panel="classes">类别</button>
+                <button class="tab" data-panel="boxes">标注</button>
+            </nav>
+
+            <div id="panel-images" class="panel active">
+                <div class="panel-head">
+                    <span id="listCount">0 张</span>
+                    <span class="panel-actions">
+                        <label class="mini-check"><input type="checkbox" id="onlyPending"> 只看未标注</label>
+                        <button id="clearAllBtn" class="minibtn danger">清空</button>
+                    </span>
+                </div>
+                <div id="imageList" class="image-list"></div>
+            </div>
+
+            <div id="panel-classes" class="panel">
+                <p class="panel-tip">勾选后，自动标注只输出这些类别；不勾选表示全部。</p>
+                <div class="panel-head">
+                    <span id="classCount">0 类</span>
+                    <span class="panel-actions">
+                        <button id="selectAllClasses" class="minibtn">全选</button>
+                        <button id="clearClasses" class="minibtn">清空</button>
+                    </span>
+                </div>
+                <div id="classList" class="class-list"></div>
+            </div>
+
+            <div id="panel-boxes" class="panel">
+                <p class="panel-tip">点选框后可改类别、微调坐标；Delete 删除，Ctrl+Z 撤销。</p>
+                <div id="boxList" class="box-list"></div>
+            </div>
+        </aside>
+    </main>
+
+    <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.bmp,.webp" hidden>
+    <input type="file" id="modelFileInput" accept=".pt" hidden>
+</div>
+
+<div id="exportModal" class="modal hidden">
+    <div class="modal-box">
+        <h2>导出数据集</h2>
+        <p class="modal-tip">在服务端打包成 zip，由浏览器直接下载。</p>
+
+        <div class="field">
+            <label class="field-label">格式</label>
+            <div id="exportFormats" class="format-grid"></div>
+        </div>
+
+        <div class="field">
+            <label class="check"><input type="checkbox" id="includeImages" checked> 包含原始图片</label>
+            <label class="check"><input type="checkbox" id="onlyUsedClasses" checked> 只导出有标注的类别</label>
+        </div>
+
+        <div class="field">
+            <label class="check"><input type="checkbox" id="splitVal" checked> 划分验证集</label>
+            <select id="valRatio" class="select-inline">
+                <option value="0.1">10%</option>
+                <option value="0.2" selected>20%</option>
+                <option value="0.3">30%</option>
+            </select>
+        </div>
+
+        <div class="modal-actions">
+            <button id="cancelExport" class="btn btn-ghost">取消</button>
+            <button id="confirmExport" class="btn btn-primary">下载 zip</button>
+        </div>
     </div>
+</div>
 
-    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+<div id="batchOverlay" class="modal hidden">
+    <div class="modal-box narrow">
+        <h2>批量标注中</h2>
+        <div class="progress"><div id="batchBar"></div></div>
+        <p class="progress-text">
+            已处理 <b id="batchDone">0</b> / <b id="batchTotal">0</b>
+            <span id="batchFailed"></span>
+        </p>
+        <p id="batchCurrent" class="progress-current"></p>
+        <div class="modal-actions">
+            <button id="batchCancel" class="btn btn-ghost">取消</button>
+        </div>
+    </div>
+</div>
+
+<div id="helpModal" class="modal hidden">
+    <div class="modal-box">
+        <h2>快捷键</h2>
+        <table class="shortcuts">
+            <tr><td>拖动空白</td><td>新建检测框</td></tr>
+            <tr><td>拖动框内</td><td>移动检测框</td></tr>
+            <tr><td>拖动控制点</td><td>缩放检测框</td></tr>
+            <tr><td>Delete / Backspace</td><td>删除选中的框</td></tr>
+            <tr><td>Ctrl + Z / Ctrl + Shift + Z</td><td>撤销 / 重做</td></tr>
+            <tr><td>Ctrl + S</td><td>立即保存</td></tr>
+            <tr><td>方向键（Shift 加速）</td><td>微调位置</td></tr>
+            <tr><td>1 – 9</td><td>给选中的框切换类别</td></tr>
+            <tr><td>空格 + 拖动 / 中键拖动</td><td>平移画布</td></tr>
+            <tr><td>滚轮</td><td>以光标为中心缩放</td></tr>
+            <tr><td>F</td><td>适应窗口</td></tr>
+            <tr><td>PageUp / PageDown</td><td>上一张 / 下一张</td></tr>
+        </table>
+        <div class="modal-actions">
+            <button id="closeHelp" class="btn btn-primary">知道了</button>
+        </div>
+    </div>
+</div>
+
+<div id="toastHost" class="toast-host"></div>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
 </body>
 </html>

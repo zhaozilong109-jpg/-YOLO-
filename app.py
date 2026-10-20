@@ -1,624 +1,491 @@
+"""YOLO 智能标注工具 —— Flask 路由层。
+
+启动：python app.py    然后访问 http://127.0.0.1:5000
 """
-YOLO 智能标注工具 - 后端服务
-基于 Flask + Ultralytics YOLO
-"""
+
+from __future__ import annotations
+
+import io
 import os
-import json
-import shutil
 import threading
 import time
 import uuid
-
-import cv2
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
+from pathlib import Path
 
 from flask import (
-    Flask, request, jsonify, render_template,
-    send_from_directory, url_for
+    Flask,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    send_from_directory,
+    url_for,
 )
-from werkzeug.utils import secure_filename
-
-# ========== 配置（使用绝对路径）==========
-# 获取 app.py 所在的目录作为项目根目录
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-app = Flask(__name__)
-
-
-def _path(folder):
-    """将相对路径转为项目根目录下的绝对路径"""
-    return os.path.join(BASE_DIR, folder)
-
-
-app.config['UPLOAD_FOLDER'] = _path('uploads')
-app.config['ANNOTATION_FOLDER'] = _path('annotations')
-app.config['MODEL_FOLDER'] = _path('models')
-app.config['EXPORT_FOLDER'] = _path('exports')
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 最大上传 50MB
-app.config['ALLOWED_EXTENSIONS'] = {'jpg', 'jpeg', 'png'}
-
-# 确保目录存在
-for folder in [app.config['UPLOAD_FOLDER'], app.config['ANNOTATION_FOLDER'],
-               app.config['MODEL_FOLDER'], app.config['EXPORT_FOLDER']]:
-    os.makedirs(folder, exist_ok=True)
-
-# 全局变量：当前加载的模型
-current_model = None
-current_model_name = None
-
-# 保存每张图片的标注结果
-# 结构: { "图片文件名": {"boxes": [...], "img_w": 100, "img_h": 100} }
-annotations_store = {}
-
-
-def allowed_file(filename):
-    """检查文件扩展名是否允许"""
-    return '.' in filename and \
-        filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
-
-
-# ========== 页面路由 ==========
-
-@app.route('/')
-def index():
-    """首页"""
-    return render_template('index.html')
-
-
-# ========== 图片管理 API ==========
-
-@app.route('/api/upload', methods=['POST'])
-def upload_images():
-    """上传图片"""
-    if 'files' not in request.files:
-        return jsonify({'error': '没有选择文件'}), 400
-
-    files = request.files.getlist('files')
-    uploaded = []
-
-    for file in files:
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            # 避免重名
-            name, ext = os.path.splitext(filename)
-            save_name = filename
-            counter = 1
-            while os.path.exists(os.path.join(app.config['UPLOAD_FOLDER'], save_name)):
-                save_name = f"{name}_{counter}{ext}"
-                counter += 1
-
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], save_name))
-            uploaded.append(save_name)
-
-    return jsonify({
-        'success': True,
-        'uploaded': uploaded,
-        'count': len(uploaded)
-    })
-
-
-@app.route('/api/images', methods=['GET'])
-def get_images():
-    """获取所有已上传的图片列表"""
-    image_dir = app.config['UPLOAD_FOLDER']
-    if not os.path.exists(image_dir):
-        return jsonify({'images': []})
-
-    images = []
-    for f in sorted(os.listdir(image_dir)):
-        if allowed_file(f):
-            status = 'annotated' if f in annotations_store else 'pending'
-            images.append({
-                'filename': f,
-                'url': url_for('uploaded_file', filename=f),
-                'status': status
-            })
-
-    return jsonify({'images': images})
-
-
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    """提供上传的图片文件"""
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-
-@app.route('/api/delete_images', methods=['POST'])
-def delete_images():
-    """删除选中的图片"""
-    filenames = request.json.get('filenames', [])
-    for f in filenames:
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f)
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        # 同时清除标注
-        if f in annotations_store:
-            del annotations_store[f]
-    return jsonify({'success': True})
-
-
-@app.route('/api/clear_all', methods=['POST'])
-def clear_all():
-    """清空所有图片和标注"""
-    for folder in [app.config['UPLOAD_FOLDER'], app.config['ANNOTATION_FOLDER']]:
-        for f in os.listdir(folder):
-            fpath = os.path.join(folder, f)
-            if os.path.isfile(fpath):
-                os.remove(fpath)
-    annotations_store.clear()
-    return jsonify({'success': True})
-
-
-# ========== 模型管理 API ==========
-
-@app.route('/api/models', methods=['GET'])
-def get_models():
-    """获取可用模型列表（预训练 + 自定义）"""
-    # 预训练模型
-    pretrained = [
-        {'name': 'yolov8n.pt', 'label': 'YOLOv8n (轻量)'},
-        {'name': 'yolov8s.pt', 'label': 'YOLOv8s (小型)'},
-        {'name': 'yolov8m.pt', 'label': 'YOLOv8m (中等)'},
-        {'name': 'yolov5su.pt', 'label': 'YOLOv5su (轻量)'},
-    ]
-
-    # 自定义模型（用户上传的）
-    custom = []
-    model_dir = app.config['MODEL_FOLDER']
-    if os.path.exists(model_dir):
-        for f in os.listdir(model_dir):
-            if f.endswith('.pt'):
-                custom.append({
-                    'name': f,
-                    'label': f'自定义: {f}',
-                    'custom': True
-                })
-
-    return jsonify({
-        'pretrained': pretrained,
-        'custom': custom
-    })
-
-
-@app.route('/api/upload_model', methods=['POST'])
-def upload_model():
-    """上传自定义模型文件 (.pt)"""
-    if 'model' not in request.files:
-        return jsonify({'error': '没有选择模型文件'}), 400
-
-    file = request.files['model']
-    if file and file.filename.endswith('.pt'):
-        filename = secure_filename(file.filename)
-        file.save(os.path.join(app.config['MODEL_FOLDER'], filename))
-        return jsonify({'success': True, 'name': filename})
-    return jsonify({'error': '仅支持 .pt 格式的模型文件'}), 400
-
-
-@app.route('/api/load_model', methods=['POST'])
-def load_model():
-    """加载选中的模型"""
-    global current_model, current_model_name
-
-    model_name = request.json.get('model_name')
-    if not model_name:
-        return jsonify({'error': '未指定模型'}), 400
-
-    try:
-        from ultralytics import YOLO
-
-        # 先检查 models 目录下是否有
-        model_path = os.path.join(app.config['MODEL_FOLDER'], model_name)
-
-        if not os.path.exists(model_path):
-            # 预训练模型：让 ultralytics 下载到项目根目录，再移到 models 目录
-            print(f"[INFO] 下载预训练模型: {model_name}")
-            # 先切到项目根目录下载，避免路径混乱
-            old_cwd = os.getcwd()
-            os.chdir(BASE_DIR)
-            try:
-                tmp_model = YOLO(model_name)
-                # 下载完成后将 .pt 文件移到 models 目录
-                src = os.path.join(BASE_DIR, model_name)
-                if os.path.exists(src):
-                    shutil.move(src, model_path)
-                os.chdir(old_cwd)
-            except Exception:
-                os.chdir(old_cwd)
-                raise
-
-        # 从 models 目录加载
-        current_model = YOLO(model_path)
-        current_model_name = model_name
-
-        return jsonify({
-            'success': True,
-            'model_name': model_name,
-            'classes': current_model.names  # 返回类别名称
-        })
-    except Exception as e:
-        return jsonify({'error': f'模型加载失败: {str(e)}'}), 500
-
-
-# ========== 标注 API ==========
-
-@app.route('/api/annotate', methods=['POST'])
-def annotate_single():
-    """标注单张图片"""
-    global current_model
-
-    if current_model is None:
-        return jsonify({'error': '请先加载模型'}), 400
-
-    filename = request.json.get('filename')
-    confidence = float(request.json.get('confidence', 0.25))
-    iou = float(request.json.get('iou', 0.45))
-
-    img_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if not os.path.exists(img_path):
-        return jsonify({'error': '图片不存在'}), 404
-
-    try:
-        # 用 YOLO 进行推理
-        results = current_model(
-            img_path,
-            conf=confidence,
-            iou=iou,
-            verbose=False
-        )[0]
-
-        # 读取图片尺寸（无论有无检测框都需要）
-        img = cv2.imread(img_path)
-        img_h, img_w = img.shape[:2]
-
-        # 解析检测结果
-        boxes_data = []
-        if results.boxes is not None:
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                boxes_data.append({
-                    'x1': round(x1, 1),
-                    'y1': round(y1, 1),
-                    'x2': round(x2, 1),
-                    'y2': round(y2, 1),
-                    'confidence': round(float(box.conf[0]), 4),
-                    'class_id': int(box.cls[0]),
-                    'class_name': results.names[int(box.cls[0])]
-                })
-
-        # 保存标注结果
-        annotations_store[filename] = {
-            'boxes': boxes_data,
-            'img_w': img_w,
-            'img_h': img_h
-        }
-
-        return jsonify({
-            'success': True,
-            'filename': filename,
-            'boxes': boxes_data,
-            'img_w': img_w,
-            'img_h': img_h
-        })
-
-    except Exception as e:
-        return jsonify({'error': f'标注失败: {str(e)}'}), 500
-
-
-@app.route('/api/annotate_batch', methods=['POST'])
-def annotate_batch():
-    """批量标注 - 每次请求标注一张，配合前端轮询进度"""
-    global current_model
-
-    if current_model is None:
-        return jsonify({'error': '请先加载模型'}), 400
-
-    confidence = float(request.json.get('confidence', 0.25))
-    iou = float(request.json.get('iou', 0.45))
-
-    # 找出所有未标注的图片
-    image_dir = app.config['UPLOAD_FOLDER']
-    unannotated = []
-    for f in sorted(os.listdir(image_dir)):
-        if allowed_file(f) and f not in annotations_store:
-            unannotated.append(f)
-
-    total = len(unannotated)
-    done = len([f for f in os.listdir(image_dir) if allowed_file(f)]) - total
-
-    if total == 0:
-        return jsonify({
-            'success': True,
-            'completed': True,
-            'done': done,
-            'total': done,
-            'message': '所有图片均已标注完成'
-        })
-
-    # 标注下一张
-    filename = unannotated[0]
-    try:
-        results = current_model(
-            os.path.join(image_dir, filename),
-            conf=confidence,
-            iou=iou,
-            verbose=False
-        )[0]
-
-        img = cv2.imread(os.path.join(image_dir, filename))
-        img_h, img_w = img.shape[:2]
-
-        boxes_data = []
-        if results.boxes is not None:
-            for box in results.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                boxes_data.append({
-                    'x1': round(x1, 1),
-                    'y1': round(y1, 1),
-                    'x2': round(x2, 1),
-                    'y2': round(y2, 1),
-                    'confidence': round(float(box.conf[0]), 4),
-                    'class_id': int(box.cls[0]),
-                    'class_name': results.names[int(box.cls[0])]
-                })
-
-        annotations_store[filename] = {
-            'boxes': boxes_data,
-            'img_w': img_w,
-            'img_h': img_h
-        }
-
-        # 检查是否全部完成
-        remaining = total - 1
-        done_now = done + 1
-        is_completed = remaining == 0
-
-        return jsonify({
-            'success': True,
-            'completed': is_completed,
-            'filename': filename,
-            'boxes': boxes_data,
-            'done': done_now,
-            'remaining': remaining,
-            'total': done_now + remaining
-        })
-
-    except Exception as e:
-        return jsonify({'error': f'标注失败: {filename} - {str(e)}'}), 500
-
-
-@app.route('/api/annotation/<filename>', methods=['GET'])
-def get_annotation(filename):
-    """获取某张图片的标注结果"""
-    if filename in annotations_store:
-        return jsonify(annotations_store[filename])
-    return jsonify({'boxes': [], 'img_w': 0, 'img_h': 0})
-
-
-@app.route('/api/annotations_count', methods=['GET'])
-def annotations_count():
-    """获取标注进度统计"""
-    image_dir = app.config['UPLOAD_FOLDER']
-    total = 0
-    for f in os.listdir(image_dir):
-        if allowed_file(f):
-            total += 1
-    done = len(annotations_store)
-    return jsonify({
-        'total': total,
-        'done': done,
-        'remaining': total - done
-    })
-
-
-# ========== 导出 API ==========
-
-def export_yolo_txt(filename, annotation, output_dir):
-    """导出为 YOLO TXT 格式"""
-    txt_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.txt')
-    lines = []
-    for box in annotation['boxes']:
-        # YOLO格式: class_id x_center y_center width height (归一化)
-        x_center = (box['x1'] + box['x2']) / 2 / annotation['img_w']
-        y_center = (box['y1'] + box['y2']) / 2 / annotation['img_h']
-        width = (box['x2'] - box['x1']) / annotation['img_w']
-        height = (box['y2'] - box['y1']) / annotation['img_h']
-        lines.append(f"{box['class_id']} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
-    with open(txt_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
-
-
-def export_yolo_json(filename, annotation, output_dir):
-    """导出为 YOLO JSON 格式"""
-    data = {
-        'version': '1.0',
-        'filename': filename,
-        'image_width': annotation['img_w'],
-        'image_height': annotation['img_h'],
-        'annotations': []
-    }
-    for box in annotation['boxes']:
-        data['annotations'].append({
-            'class_id': box['class_id'],
-            'class_name': box['class_name'],
-            'bbox': [box['x1'], box['y1'], box['x2'], box['y2']],
-            'confidence': box['confidence']
-        })
-    json_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def export_coco_json(all_data, output_dir):
-    """导出为 COCO JSON 格式（所有图片合并为一个文件）"""
-    images = []
-    annotations = []
-    categories = {}
-    ann_id = 1
-
-    for filename, annotation in all_data.items():
-        img_id = len(images) + 1
-        images.append({
-            'id': img_id,
-            'file_name': filename,
-            'width': annotation['img_w'],
-            'height': annotation['img_h']
-        })
-
-        for box in annotation['boxes']:
-            if box['class_name'] not in categories:
-                cat_id = len(categories) + 1
-                categories[box['class_name']] = {
-                    'id': cat_id,
-                    'name': box['class_name']
-                }
-            cat_id = categories[box['class_name']]['id']
-
-            x = box['x1']
-            y = box['y1']
-            w = box['x2'] - box['x1']
-            h = box['y2'] - box['y1']
-
-            annotations.append({
-                'id': ann_id,
-                'image_id': img_id,
-                'category_id': cat_id,
-                'bbox': [x, y, w, h],
-                'area': w * h,
-                'iscrowd': 0,
-                'confidence': box['confidence']
-            })
-            ann_id += 1
-
-    coco_data = {
-        'images': images,
-        'annotations': annotations,
-        'categories': list(categories.values())
-    }
-
-    json_path = os.path.join(output_dir, 'coco_annotations.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(coco_data, f, indent=2, ensure_ascii=False)
-
-    return json_path
-
-
-def export_pascal_voc(filename, annotation, output_dir):
-    """导出为 Pascal VOC XML 格式"""
-    root = ET.Element('annotation')
-    ET.SubElement(root, 'filename').text = filename
-
-    size = ET.SubElement(root, 'size')
-    ET.SubElement(size, 'width').text = str(int(annotation['img_w']))
-    ET.SubElement(size, 'height').text = str(int(annotation['img_h']))
-    ET.SubElement(size, 'depth').text = '3'
-
-    for box in annotation['boxes']:
-        obj = ET.SubElement(root, 'object')
-        ET.SubElement(obj, 'name').text = box['class_name']
-        ET.SubElement(obj, 'pose').text = 'Unspecified'
-        ET.SubElement(obj, 'truncated').text = '0'
-        ET.SubElement(obj, 'difficult').text = '0'
-        bndbox = ET.SubElement(obj, 'bndbox')
-        ET.SubElement(bndbox, 'xmin').text = str(int(box['x1']))
-        ET.SubElement(bndbox, 'ymin').text = str(int(box['y1']))
-        ET.SubElement(bndbox, 'xmax').text = str(int(box['x2']))
-        ET.SubElement(bndbox, 'ymax').text = str(int(box['y2']))
-
-    xml_str = minidom.parseString(ET.tostring(root)).toprettyxml(indent='  ')
-    xml_path = os.path.join(output_dir, os.path.splitext(filename)[0] + '.xml')
-    with open(xml_path, 'w', encoding='utf-8') as f:
-        f.write(xml_str)
-
-
-@app.route('/api/export', methods=['POST'])
-def export_annotations():
-    """导出标注结果"""
-    format_type = request.json.get('format', 'yolo_txt')
-    if not annotations_store:
-        return jsonify({'error': '没有标注数据可导出'}), 400
-
-    # 创建导出目录
-    export_dir = os.path.join(
-        app.config['EXPORT_FOLDER'],
-        f'export_{uuid.uuid4().hex[:8]}'
-    )
-    os.makedirs(export_dir, exist_ok=True)
-
-    try:
-        if format_type == 'yolo_txt':
-            for filename, annotation in annotations_store.items():
-                export_yolo_txt(filename, annotation, export_dir)
-            return jsonify({
-                'success': True,
-                'path': export_dir,
-                'count': len(annotations_store)
-            })
-
-        elif format_type == 'yolo_json':
-            for filename, annotation in annotations_store.items():
-                export_yolo_json(filename, annotation, export_dir)
-            return jsonify({
-                'success': True,
-                'path': export_dir,
-                'count': len(annotations_store)
-            })
-
-        elif format_type == 'coco_json':
-            path = export_coco_json(annotations_store, export_dir)
-            return jsonify({
-                'success': True,
-                'path': path,
-                'count': len(annotations_store)
-            })
-
-        elif format_type == 'pascal_voc':
-            for filename, annotation in annotations_store.items():
-                export_pascal_voc(filename, annotation, export_dir)
-            return jsonify({
-                'success': True,
-                'path': export_dir,
-                'count': len(annotations_store)
-            })
-
-        else:
-            return jsonify({'error': f'不支持的导出格式: {format_type}'}), 400
-
-    except Exception as e:
-        return jsonify({'error': f'导出失败: {str(e)}'}), 500
-
-
-# ========== 关闭服务 ==========
-
-@app.route('/api/shutdown', methods=['POST'])
-def shutdown():
-    """关闭服务器（前端点击关闭按钮时调用）"""
-    # 先返回响应，再退出
-    shutdown_response = jsonify({'success': True, 'message': '服务已关闭'})
-
-    # 延迟退出，确保响应先发送到浏览器
-    def _delayed_exit():
-        time.sleep(0.5)          # 等响应发送完毕
-        # 如果存在 reloader 父进程（debug 模式），也杀掉它
+from PIL import Image, UnidentifiedImageError
+from werkzeug.exceptions import RequestEntityTooLarge
+
+from core import config
+from core.exporter import FORMAT_LABELS, SUPPORTED_FORMATS, ExportError, build_export
+from core.inference import BatchRunner, InferenceError, ModelManager
+from core.storage import (
+    AnnotationStore,
+    PathTraversalError,
+    StorageError,
+    resolve_within,
+    sanitize_filename,
+    unique_path,
+)
+
+APP_VERSION = "0.2.0"
+
+
+def _clean_class_filter(raw) -> list[int] | None:
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    result = []
+    for item in raw:
         try:
-            ppid = os.getppid()
-            if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' and ppid > 1:
-                os.kill(ppid, 9)  # 杀 reloader 父进程
-        except Exception:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(result)) or None
+
+
+def _float_value(raw, default: float) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def create_app(data_dir: Path | str | None = None) -> Flask:
+    """应用工厂：测试时可以把数据目录指到临时路径。"""
+    root = Path(data_dir).resolve() if data_dir else config.DATA_DIR
+
+    dirs = {
+        "UPLOAD_DIR": root / "uploads",
+        "ANNOTATION_DIR": root / "annotations",
+        "MODEL_DIR": root / "models",
+        "EXPORT_DIR": root / "exports",
+    }
+    for folder in dirs.values():
+        folder.mkdir(parents=True, exist_ok=True)
+
+    app = Flask(__name__)
+    app.config.update(dirs)
+    app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
+    app.config["ALLOWED_EXTENSIONS"] = config.ALLOWED_EXTENSIONS
+    try:
+        app.json.ensure_ascii = False
+    except AttributeError:  # Flask < 2.2
+        app.config["JSON_AS_ASCII"] = False
+
+    upload_dir: Path = app.config["UPLOAD_DIR"]
+
+    store = AnnotationStore(app.config["ANNOTATION_DIR"])
+    models = ModelManager(app.config["MODEL_DIR"])
+    batch = BatchRunner(models, store, upload_dir)
+
+    app.extensions["store"] = store
+    app.extensions["models"] = models
+    app.extensions["batch"] = batch
+
+    # ------------------------------------------------------------ 工具函数
+
+    def image_path(filename: str) -> Path:
+        """把图片名解析成 uploads/ 下的真实路径，越界直接抛错。"""
+        path = resolve_within(upload_dir, filename)
+        if not path.is_file():
+            raise StorageError(f"图片不存在: {filename}")
+        return path
+
+    def is_image_name(name: str) -> bool:
+        if "." not in name:
+            return False
+        ext = name.rsplit(".", 1)[1].lower()
+        return ext in app.config["ALLOWED_EXTENSIONS"]
+
+    def list_image_names() -> list[str]:
+        try:
+            entries = list(upload_dir.iterdir())
+        except OSError:
+            return []
+        names = [p.name for p in entries if p.is_file() and is_image_name(p.name)]
+        return sorted(names, key=str.lower)
+
+    # ------------------------------------------------------------ 页面
+
+    @app.get("/")
+    def index():
+        return render_template("index.html", version=APP_VERSION)
+
+    @app.get("/api/health")
+    def health():
+        return jsonify(
+            ok=True,
+            version=APP_VERSION,
+            model=models.model_name,
+            images=len(list_image_names()),
+            annotations=store.count(),
+        )
+
+    # ------------------------------------------------------------ 图片管理
+
+    @app.post("/api/upload")
+    def upload_images():
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify(error="没有选择文件"), 400
+
+        uploaded: list[dict] = []
+        skipped: list[dict] = []
+
+        for storage_file in files:
+            raw_name = storage_file.filename or ""
+            try:
+                safe_name = sanitize_filename(
+                    raw_name, app.config["ALLOWED_EXTENSIONS"]
+                )
+            except StorageError as exc:
+                skipped.append({"filename": raw_name, "reason": str(exc)})
+                continue
+
+            tmp_path = upload_dir / f".upload-{uuid.uuid4().hex}.tmp"
+            try:
+                storage_file.save(tmp_path)
+                if tmp_path.stat().st_size == 0:
+                    raise StorageError("文件为空")
+
+                # 只信任真实的图片内容，不信任扩展名
+                with Image.open(tmp_path) as probe:
+                    probe.verify()
+
+                target = unique_path(upload_dir, safe_name)
+                os.replace(tmp_path, target)
+                uploaded.append(
+                    {
+                        "filename": target.name,
+                        "original": raw_name,
+                        "renamed": target.name != raw_name,
+                    }
+                )
+            except (StorageError, UnidentifiedImageError, OSError) as exc:
+                skipped.append({"filename": raw_name, "reason": str(exc)})
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+        if not uploaded and skipped:
+            return (
+                jsonify(error="所有文件都上传失败", skipped=skipped, count=0),
+                400,
+            )
+
+        return jsonify(
+            success=True,
+            uploaded=uploaded,
+            skipped=skipped,
+            count=len(uploaded),
+        )
+
+    @app.get("/api/images")
+    def get_images():
+        items = []
+        for name in list_image_names():
+            annotation = store.get(name)
+            path = upload_dir / name
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            items.append(
+                {
+                    "filename": name,
+                    "url": url_for("uploaded_file", filename=name),
+                    "annotated": annotation is not None,
+                    "boxes": len(annotation["boxes"]) if annotation else 0,
+                    "size": size,
+                }
+            )
+        return jsonify(images=items, count=len(items))
+
+    @app.get("/uploads/<path:filename>")
+    def uploaded_file(filename: str):
+        # send_from_directory 自身已做目录穿越防护
+        return send_from_directory(upload_dir, filename)
+
+    @app.post("/api/delete_images")
+    def delete_images():
+        payload = request.get_json(silent=True) or {}
+        names = payload.get("filenames") or []
+        if not isinstance(names, list):
+            return jsonify(error="filenames 必须是数组"), 400
+
+        deleted = []
+        for name in names:
+            try:
+                path = image_path(str(name))
+            except (StorageError, PathTraversalError):
+                continue
+            try:
+                path.unlink()
+                store.delete(path.name)
+                deleted.append(path.name)
+            except OSError:
+                continue
+
+        return jsonify(success=True, deleted=deleted, count=len(deleted))
+
+    @app.post("/api/clear_all")
+    def clear_all():
+        removed = 0
+        for name in list_image_names():
+            try:
+                (upload_dir / name).unlink()
+                removed += 1
+            except OSError:
+                continue
+        store.clear()
+        return jsonify(success=True, removed=removed)
+
+    # ------------------------------------------------------------ 模型
+
+    @app.get("/api/models")
+    def get_models():
+        return jsonify(models.available())
+
+    @app.post("/api/upload_model")
+    def upload_model():
+        storage_file = request.files.get("model")
+        if storage_file is None or not storage_file.filename:
+            return jsonify(error="没有选择模型文件"), 400
+
+        raw_name = os.path.basename(storage_file.filename.replace("\\", "/"))
+        if not raw_name.lower().endswith(".pt"):
+            return jsonify(error="仅支持 .pt 格式的模型文件"), 400
+
+        safe_name = f"{Path(raw_name).stem[:80]}.pt"
+        target = unique_path(Path(app.config["MODEL_DIR"]), safe_name)
+        storage_file.save(target)
+        return jsonify(success=True, name=target.name)
+
+    @app.post("/api/load_model")
+    def load_model():
+        payload = request.get_json(silent=True) or {}
+        name = payload.get("model_name")
+        if not name:
+            return jsonify(error="未指定模型"), 400
+        classes = models.load(str(name))
+        return jsonify(success=True, model_name=models.model_name, classes=classes)
+
+    @app.get("/api/classes")
+    def get_classes():
+        return jsonify(classes=models.classes(), model=models.model_name)
+
+    # ------------------------------------------------------------ 标注
+
+    @app.get("/api/annotation/<path:filename>")
+    def get_annotation(filename: str):
+        annotation = store.get(filename)
+        if annotation is not None:
+            return jsonify(annotation)
+
+        # 没有标注时返回图片的真实尺寸，方便前端直接画框
+        img_w = img_h = 0
+        try:
+            with Image.open(image_path(filename)) as image:
+                img_w, img_h = image.size
+        except (StorageError, UnidentifiedImageError, OSError):
             pass
-        os._exit(0)
+        return jsonify(filename=filename, img_w=img_w, img_h=img_h, boxes=[])
 
-    threading.Thread(target=_delayed_exit, daemon=False).start()
+    @app.put("/api/annotation/<path:filename>")
+    def save_annotation(filename: str):
+        """保存人工修正后的标注（前端拖动/新增/删除后调用）。"""
+        image_path(filename)  # 确保这张图确实存在，避免写入垃圾数据
+        payload = request.get_json(silent=True) or {}
 
-    return shutdown_response
+        img_w = int(_float_value(payload.get("img_w"), 0))
+        img_h = int(_float_value(payload.get("img_h"), 0))
+        if img_w <= 0 or img_h <= 0:
+            try:
+                with Image.open(image_path(filename)) as image:
+                    img_w, img_h = image.size
+            except (UnidentifiedImageError, OSError):
+                return jsonify(error="读取图片尺寸失败"), 400
+
+        boxes = payload.get("boxes")
+        if not isinstance(boxes, list):
+            return jsonify(error="boxes 必须是数组"), 400
+
+        saved = store.put(filename, boxes, img_w, img_h)
+        return jsonify(success=True, **saved)
+
+    @app.post("/api/annotate")
+    def annotate_single():
+        payload = request.get_json(silent=True) or {}
+        filename = payload.get("filename")
+        if not filename:
+            return jsonify(error="缺少图片文件名"), 400
+
+        path = image_path(str(filename))
+        boxes, img_w, img_h = models.annotate(
+            path,
+            conf=_float_value(payload.get("confidence"), 0.25),
+            iou=_float_value(payload.get("iou"), 0.45),
+            classes=_clean_class_filter(payload.get("classes")),
+        )
+        saved = store.put(path.name, boxes, img_w, img_h)
+        return jsonify(success=True, **saved)
+
+    @app.post("/api/batch")
+    def start_batch():
+        payload = request.get_json(silent=True) or {}
+        include_annotated = bool(payload.get("include_annotated", False))
+
+        files = [
+            name
+            for name in list_image_names()
+            if include_annotated or not store.has(name)
+        ]
+        if not files:
+            return (
+                jsonify(
+                    error="没有待标注的图片",
+                    message="所有图片都已标注，可勾选「重新标注全部」再试",
+                ),
+                400,
+            )
+
+        job = batch.start(
+            files,
+            conf=_float_value(payload.get("confidence"), 0.25),
+            iou=_float_value(payload.get("iou"), 0.45),
+            classes=_clean_class_filter(payload.get("classes")),
+        )
+        return jsonify(success=True, **job)
+
+    @app.get("/api/batch/<job_id>")
+    def batch_status(job_id: str):
+        job = batch.snapshot(job_id)
+        if job is None:
+            return jsonify(error="任务不存在"), 404
+        return jsonify(job)
+
+    @app.post("/api/batch/<job_id>/cancel")
+    def batch_cancel(job_id: str):
+        if not batch.cancel(job_id):
+            return jsonify(error="任务不存在"), 404
+        return jsonify(success=True, **batch.snapshot(job_id))
+
+    @app.get("/api/stats")
+    def stats():
+        names = list_image_names()
+        annotated = sum(1 for name in names if store.has(name))
+        items = store.all_items()
+        return jsonify(
+            total=len(names),
+            annotated=annotated,
+            pending=len(names) - annotated,
+            boxes=sum(len(item["boxes"]) for item in items.values()),
+            class_names={str(k): v for k, v in store.class_names().items()},
+        )
+
+    # ------------------------------------------------------------ 导出
+
+    @app.post("/api/export")
+    def export_annotations():
+        payload = request.get_json(silent=True) or {}
+        fmt = str(payload.get("format") or "yolo_txt")
+        include_images = bool(payload.get("include_images", False))
+        val_ratio = min(
+            max(_float_value(payload.get("val_ratio"), 0.0), 0.0),
+            config.MAX_VAL_RATIO,
+        )
+
+        annotations = store.all_items()
+        if not annotations:
+            return jsonify(error="没有标注数据可导出，请先标注图片"), 400
+
+        class_map = {**store.class_names(), **models.classes()}
+        data, filename = build_export(
+            fmt,
+            annotations,
+            class_map,
+            upload_dir,
+            include_images=include_images,
+            val_ratio=val_ratio,
+            only_used_classes=bool(payload.get("only_used_classes", True)),
+        )
+
+        return send_file(
+            io.BytesIO(data),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=filename,
+        )
+
+    @app.get("/api/export/formats")
+    def export_formats():
+        return jsonify(
+            formats=[
+                {"value": key, "label": label}
+                for key, label in FORMAT_LABELS.items()
+                if key in SUPPORTED_FORMATS
+            ]
+        )
+
+    # ------------------------------------------------------------ 关闭服务
+
+    @app.post("/api/shutdown")
+    def shutdown():
+        def _exit_soon():
+            time.sleep(0.4)
+            os._exit(0)
+
+        threading.Thread(target=_exit_soon, daemon=True).start()
+        return jsonify(success=True, message="服务已关闭")
+
+    # ------------------------------------------------------------ 错误处理
+
+    @app.errorhandler(StorageError)
+    def handle_storage_error(exc):  # noqa: ANN001
+        return jsonify(error=str(exc)), 400
+
+    @app.errorhandler(InferenceError)
+    def handle_inference_error(exc):  # noqa: ANN001
+        return jsonify(error=str(exc)), 400
+
+    @app.errorhandler(ExportError)
+    def handle_export_error(exc):  # noqa: ANN001
+        return jsonify(error=str(exc)), 400
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_too_large(exc):  # noqa: ANN001
+        limit_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+        return jsonify(error=f"文件太大，单次上传上限 {limit_mb} MB"), 413
+
+    @app.errorhandler(404)
+    def handle_404(exc):  # noqa: ANN001
+        if request.path.startswith("/api/"):
+            return jsonify(error="接口不存在"), 404
+        return jsonify(error="页面不存在"), 404
+
+    @app.after_request
+    def no_cache_api(response):
+        if request.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    return app
 
 
-# ========== 启动 ==========
+app = create_app()
 
-if __name__ == '__main__':
-    print("=" * 50)
-    print("  YOLO 智能标注工具")
-    print("  启动服务...")
-    print("  打开浏览器访问: http://127.0.0.1:5000")
-    print("=" * 50)
-    app.run(host='127.0.0.1', port=5000, debug=False)
+
+if __name__ == "__main__":
+    print("=" * 56)
+    print(f"  YOLO 智能标注工具 v{APP_VERSION}")
+    print(f"  数据目录: {config.DATA_DIR}")
+    print(f"  启动地址: http://{config.HOST}:{config.PORT}")
+    print("=" * 56)
+    app.run(host=config.HOST, port=config.PORT, debug=False, threaded=True)
