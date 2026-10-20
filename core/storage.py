@@ -219,6 +219,24 @@ def _normalise_box(raw: Any, img_w: float, img_h: float) -> dict | None:
     return shape
 
 
+def rescale_shape(shape: dict, sx: float, sy: float) -> dict:
+    """把一个形状（矩形或多边形）按比例缩放到另一套像素网格上。"""
+    scaled = dict(shape)
+    for key in ("x1", "x2"):
+        if key in scaled:
+            scaled[key] = float(scaled[key]) * sx
+    for key in ("y1", "y2"):
+        if key in scaled:
+            scaled[key] = float(scaled[key]) * sy
+    if isinstance(shape.get("points"), list):
+        scaled["points"] = [
+            [float(point[0]) * sx, float(point[1]) * sy]
+            for point in shape["points"]
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+    return scaled
+
+
 class AnnotationStore:
     """线程安全的标注仓库，负责落盘与启动回填。"""
 

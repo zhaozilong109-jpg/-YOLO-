@@ -272,7 +272,9 @@ button:focus-visible {
 #canvas {
     display: block;
     position: absolute;
-    inset: 0;
+    left: 0;
+    top: 0;
+    /* 宽高由 JS 按容器尺寸设置，这里不要用 inset:0 之类会拉伸画布盒子的写法 */
 }
 
 .empty-hint {

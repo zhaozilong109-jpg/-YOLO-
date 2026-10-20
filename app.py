@@ -21,7 +21,7 @@ from flask import (
     send_from_directory,
     url_for,
 )
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from core import config
@@ -33,6 +33,7 @@ from core.storage import (
     AnnotationStore,
     PathTraversalError,
     StorageError,
+    rescale_shape,
     resolve_within,
     sanitize_filename,
     sanitize_stem,
@@ -109,6 +110,27 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
         if not path.is_file():
             raise StorageError(f"图片不存在: {filename}")
         return path
+
+    _size_cache: dict[str, tuple[int, int, float]] = {}
+
+    def image_size(path: Path) -> tuple[int, int]:
+        """读取图片尺寸，并应用 EXIF 方向。
+
+        手机照片常见「像素是横的、EXIF 标了旋转 90°」，浏览器会按 EXIF 显示成竖图；
+        若这里直接返回 PIL 的原始尺寸，宽高比就和画面不一致，前端按这个比例去画
+        就会把图片压扁。``exif_transpose`` 之后两者才对齐。
+
+        解码大图并不便宜，按文件名 + mtime 缓存，重复调用走缓存。
+        """
+        stat = path.stat()
+        cached = _size_cache.get(path.name)
+        if cached and cached[2] == stat.st_mtime:
+            return cached[0], cached[1]
+
+        with Image.open(path) as image:
+            width, height = ImageOps.exif_transpose(image).size
+        _size_cache[path.name] = (width, height, stat.st_mtime)
+        return width, height
 
     def is_image_name(name: str) -> bool:
         if "." not in name:
@@ -440,8 +462,7 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
         # 没有标注时返回图片的真实尺寸，方便前端直接画框
         img_w = img_h = 0
         try:
-            with Image.open(image_path(filename)) as image:
-                img_w, img_h = image.size
+            img_w, img_h = image_size(image_path(filename))
         except (StorageError, UnidentifiedImageError, OSError):
             pass
         return jsonify(filename=filename, img_w=img_w, img_h=img_h, boxes=[])
@@ -449,21 +470,36 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
     @app.put("/api/annotation/<path:filename>")
     def save_annotation(filename: str):
         """保存人工修正后的标注（前端拖动/新增/删除后调用）。"""
-        image_path(filename)  # 确保这张图确实存在，避免写入垃圾数据
+        path = image_path(filename)  # 确保这张图确实存在，避免写入垃圾数据
         payload = request.get_json(silent=True) or {}
-
-        img_w = int(_float_value(payload.get("img_w"), 0))
-        img_h = int(_float_value(payload.get("img_h"), 0))
-        if img_w <= 0 or img_h <= 0:
-            try:
-                with Image.open(image_path(filename)) as image:
-                    img_w, img_h = image.size
-            except (UnidentifiedImageError, OSError):
-                return jsonify(error="读取图片尺寸失败"), 400
 
         boxes = payload.get("boxes")
         if not isinstance(boxes, list):
             return jsonify(error="boxes 必须是数组"), 400
+
+        img_w = int(_float_value(payload.get("img_w"), 0))
+        img_h = int(_float_value(payload.get("img_h"), 0))
+
+        # 以图片真实像素为准：前端传的尺寸可能来自旧缓存或未处理 EXIF 的版本，
+        # 一旦对不上就把坐标一起缩放过去，避免存下「比例错误」的标注。
+        try:
+            real_w, real_h = image_size(path)
+        except (UnidentifiedImageError, OSError):
+            real_w = real_h = 0
+
+        if real_w and real_h:
+            if img_w <= 0 or img_h <= 0:
+                img_w, img_h = real_w, real_h
+            elif (
+                abs(img_w / real_w - 1) > 0.01 or abs(img_h / real_h - 1) > 0.01
+            ):
+                sx = real_w / img_w
+                sy = real_h / img_h
+                boxes = [rescale_shape(box, sx, sy) for box in boxes if isinstance(box, dict)]
+                img_w, img_h = real_w, real_h
+
+        if img_w <= 0 or img_h <= 0:
+            return jsonify(error="读取图片尺寸失败"), 400
 
         saved = store.put(filename, boxes, img_w, img_h)
         return jsonify(success=True, **saved)

@@ -62,6 +62,7 @@
         hoverPoint: null,
         samReady: false,
         samBusy: false,
+        loadToken: 0,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -83,12 +84,20 @@
         return state.classes[String(classId)] || `class_${classId}`;
     }
 
+    // 画面比例一律以图片自身的像素尺寸为准；标注里的 img_w/img_h 只作兜底，
+    // 否则一旦两者不一致（EXIF 旋转、旧标注文件），图片就会被拉伸。
     function imageWidth() {
-        return state.annotation.img_w || (state.image ? state.image.naturalWidth : 0);
+        if (state.image && state.image.naturalWidth) {
+            return state.image.naturalWidth;
+        }
+        return state.annotation.img_w || 0;
     }
 
     function imageHeight() {
-        return state.annotation.img_h || (state.image ? state.image.naturalHeight : 0);
+        if (state.image && state.image.naturalHeight) {
+            return state.image.naturalHeight;
+        }
+        return state.annotation.img_h || 0;
     }
 
     function toast(message, type = 'success', timeout = 3200) {
@@ -1315,25 +1324,32 @@
             row.classList.toggle('active', row.dataset.name === filename);
         });
 
+        const token = (state.loadToken = (state.loadToken || 0) + 1);
         const image = new Image();
         image.onload = async () => {
+            if (token !== state.loadToken) {
+                return; // 用户已经切到别的图了，丢弃这次结果
+            }
             state.image = image;
             $('emptyHint').classList.add('hidden');
+
+            const naturalW = image.naturalWidth || 0;
+            const naturalH = image.naturalHeight || 0;
+
             try {
                 const payload = await api(`/api/annotation/${encodeURIComponent(filename)}`);
-                state.annotation = {
-                    boxes: payload.boxes || [],
-                    img_w: payload.img_w || image.naturalWidth,
-                    img_h: payload.img_h || image.naturalHeight,
-                };
+                if (token !== state.loadToken) {
+                    return;
+                }
+                state.annotation = normaliseAnnotation(payload, naturalW, naturalH);
             } catch (error) {
-                state.annotation = {
-                    boxes: [],
-                    img_w: image.naturalWidth,
-                    img_h: image.naturalHeight,
-                };
+                if (token !== state.loadToken) {
+                    return;
+                }
+                state.annotation = { boxes: [], img_w: naturalW, img_h: naturalH };
                 toast(`读取标注失败：${error.message}`, 'error');
             }
+
             state.selected = -1;
             state.history = [];
             state.future = [];
@@ -1343,8 +1359,54 @@
             refreshBoxPanel();
             setSaveState('—', '');
         };
-        image.onerror = () => toast(`图片加载失败：${filename}`, 'error');
+        image.onerror = () => {
+            if (token === state.loadToken) {
+                toast(`图片加载失败：${filename}`, 'error');
+            }
+        };
         image.src = `/uploads/${encodeURIComponent(filename)}`;
+    }
+
+    /**
+     * 把服务端返回的标注对齐到图片的真实像素网格。
+     *
+     * 旧标注、EXIF 旋转图都可能出现「存的尺寸 ≠ 图片实际尺寸」，
+     * 这时按比例把坐标缩放过去，保证画面不被拉伸、框也不跑位。
+     */
+    function normaliseAnnotation(payload, naturalW, naturalH) {
+        const boxes = Array.isArray(payload.boxes) ? payload.boxes : [];
+        const annW = Number(payload.img_w) || naturalW;
+        const annH = Number(payload.img_h) || naturalH;
+
+        if (!naturalW || !naturalH || !annW || !annH) {
+            return { boxes, img_w: naturalW || annW, img_h: naturalH || annH };
+        }
+
+        if (Math.abs(annW - naturalW) < 0.5 && Math.abs(annH - naturalH) < 0.5) {
+            return { boxes, img_w: naturalW, img_h: naturalH };
+        }
+
+        const sx = naturalW / annW;
+        const sy = naturalH / annH;
+        return {
+            boxes: boxes.map((box) => rescaleShape(box, sx, sy)),
+            img_w: naturalW,
+            img_h: naturalH,
+        };
+    }
+
+    function rescaleShape(box, sx, sy) {
+        const scaled = {
+            ...box,
+            x1: box.x1 * sx,
+            y1: box.y1 * sy,
+            x2: box.x2 * sx,
+            y2: box.y2 * sy,
+        };
+        if (isPolygon(box)) {
+            scaled.points = box.points.map(([x, y]) => [x * sx, y * sy]);
+        }
+        return scaled;
     }
 
     async function reloadAnnotation() {
@@ -1353,11 +1415,7 @@
         }
         try {
             const payload = await api(`/api/annotation/${encodeURIComponent(state.current)}`);
-            state.annotation = {
-                boxes: payload.boxes || [],
-                img_w: payload.img_w || imageWidth(),
-                img_h: payload.img_h || imageHeight(),
-            };
+            state.annotation = normaliseAnnotation(payload, imageWidth(), imageHeight());
             draw();
             refreshBoxPanel();
         } catch (error) {
@@ -1370,6 +1428,7 @@
         state.image = null;
         state.annotation = { boxes: [], img_w: 0, img_h: 0 };
         state.selected = -1;
+        state.loadToken = (state.loadToken || 0) + 1;
         $('fileName').textContent = '未选择图片';
         $('emptyHint').classList.remove('hidden');
         $('boxCount').textContent = '0 个框';
