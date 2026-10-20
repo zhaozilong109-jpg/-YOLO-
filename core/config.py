@@ -45,9 +45,24 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-MAX_CONTENT_LENGTH = max(1, _int_env("YOLO_LABELER_MAX_UPLOAD_MB", 50)) * 1024 * 1024
+MAX_IMAGE_MB = max(
+    1, _int_env("YOLO_LABELER_MAX_IMAGE_MB", _int_env("YOLO_LABELER_MAX_UPLOAD_MB", 50))
+)
+MAX_VIDEO_MB = max(1, _int_env("YOLO_LABELER_MAX_VIDEO_MB", 512))
+MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
+MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024
+
+# Flask 在读取请求体之前就按这个值拦截，所以必须取两者较大值；
+# 每个接口内部还会按各自的限制再校验一次。
+MAX_CONTENT_LENGTH = max(MAX_IMAGE_BYTES, MAX_VIDEO_BYTES)
+
 HOST = os.environ.get("YOLO_LABELER_HOST", "127.0.0.1")
 PORT = _int_env("YOLO_LABELER_PORT", 5000)
+
+# 内容去重：同一张图重复上传时跳过（YOLO_LABELER_DEDUPE=0 可关闭）
+DEDUPE = os.environ.get("YOLO_LABELER_DEDUPE", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 
 
 def ensure_dirs() -> None:

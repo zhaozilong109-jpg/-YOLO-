@@ -13,6 +13,7 @@ uploads/
 annotations/
 exports/
 测试素材/
+upload_index.json
 
 # 模型权重（运行时由 ultralytics 自动下载）
 models/*.pt

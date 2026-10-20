@@ -37,6 +37,7 @@
 
         <div class="tool-group">
             <button id="uploadBtn" class="btn">上传图片</button>
+            <button id="videoBtn" class="btn">视频抽帧</button>
             <button id="annotateCurrentBtn" class="btn">标注当前图</button>
             <button id="batchBtn" class="btn">批量标注</button>
             <label class="mini-check" title="已标注的图片也重新跑一遍模型">
@@ -160,6 +161,36 @@
         <p id="batchCurrent" class="progress-current"></p>
         <div class="modal-actions">
             <button id="batchCancel" class="btn btn-ghost">取消</button>
+        </div>
+    </div>
+</div>
+
+<div id="videoModal" class="modal hidden">
+    <div class="modal-box">
+        <h2>从视频抽帧</h2>
+        <p class="modal-tip">按固定间隔抽帧，抽出的图片会直接加入当前图片列表；重复帧会自动跳过。</p>
+
+        <div class="field">
+            <label class="field-label">视频文件</label>
+            <input type="file" id="videoFileInput" accept="video/*">
+        </div>
+
+        <div class="field inline">
+            <label class="field-label" for="videoInterval">抽帧间隔</label>
+            <select id="videoInterval" class="select-inline">
+                <option value="0.5">0.5 秒</option>
+                <option value="1" selected>1 秒</option>
+                <option value="2">2 秒</option>
+                <option value="5">5 秒</option>
+                <option value="10">10 秒</option>
+            </select>
+            <label class="field-label" for="videoMaxFrames">最多帧数</label>
+            <input type="number" id="videoMaxFrames" class="input-inline" min="1" max="300" value="60">
+        </div>
+
+        <div class="modal-actions">
+            <button id="cancelVideo" class="btn btn-ghost">取消</button>
+            <button id="confirmVideo" class="btn btn-primary">开始抽帧</button>
         </div>
     </div>
 </div>

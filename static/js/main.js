@@ -998,6 +998,48 @@
         }
     }
 
+    // ---------------------------------------------------------------- 视频抽帧
+
+    async function importVideo() {
+        const input = $('videoFileInput');
+        const file = input.files && input.files[0];
+        if (!file) {
+            toast('先选择一个视频文件', 'info');
+            return;
+        }
+
+        const button = $('confirmVideo');
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = '抽帧中…';
+        toast('正在抽帧，视频较长时需要一会儿…', 'info', 3000);
+
+        const form = new FormData();
+        form.append('video', file);
+        form.append('interval', $('videoInterval').value);
+        form.append('max_frames', $('videoMaxFrames').value);
+
+        try {
+            const payload = await api('/api/upload_video', { method: 'POST', body: form });
+            const meta = payload.video || {};
+            const extra = payload.duplicates ? `，跳过 ${payload.duplicates} 张重复帧` : '';
+            const duration = meta.duration ? `（视频时长 ${meta.duration}s）` : '';
+            toast(`抽到 ${payload.count} 帧${extra}${duration}`, 'success', 5000);
+
+            $('videoModal').classList.add('hidden');
+            input.value = '';
+            await refreshImages();
+            if (payload.frames && payload.frames.length) {
+                selectImage(payload.frames[0]);
+            }
+        } catch (error) {
+            toast(`抽帧失败：${error.message}`, 'error', 6000);
+        } finally {
+            button.disabled = false;
+            button.textContent = original;
+        }
+    }
+
     // ---------------------------------------------------------------- 模型
 
     async function refreshModels() {
@@ -1426,6 +1468,7 @@
                 refreshBoxPanel();
                 $('exportModal').classList.add('hidden');
                 $('helpModal').classList.add('hidden');
+                $('videoModal').classList.add('hidden');
                 break;
             case 'ArrowLeft':
             case 'ArrowRight':
@@ -1535,6 +1578,10 @@
             uploadFiles(event.target.files);
             event.target.value = '';
         });
+
+        $('videoBtn').addEventListener('click', () => $('videoModal').classList.remove('hidden'));
+        $('cancelVideo').addEventListener('click', () => $('videoModal').classList.add('hidden'));
+        $('confirmVideo').addEventListener('click', importVideo);
 
         $('modelSelect').addEventListener('change', (event) => {
             if (event.target.value === '__upload__') {

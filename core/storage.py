@@ -34,6 +34,26 @@ _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
 _MAX_STEM_LEN = 80
 
 
+def _clean_stem(stem: str, fallback: str) -> str:
+    """清洗不含扩展名的文件名主干（允许中文）。"""
+    stem = _ILLEGAL_CHARS.sub("_", stem).strip().strip(".")
+    if not stem:
+        stem = fallback
+    if stem.upper() in _RESERVED_NAMES:
+        stem = f"_{stem}"
+    # 末尾的点和空格在 Windows 上会被静默截断，先处理掉
+    stem = stem.rstrip(". ")[:_MAX_STEM_LEN].rstrip(". ")
+    return stem or fallback
+
+
+def sanitize_stem(raw: str, fallback: str = "video") -> str:
+    """从任意文件名里取出安全的主干，用于视频抽帧命名。"""
+    name = str(raw or "").replace("\\", "/").split("/")[-1]
+    name = unicodedata.normalize("NFC", name).strip()
+    stem = name.rpartition(".")[0] if "." in name else name
+    return _clean_stem(stem, fallback)
+
+
 def sanitize_filename(raw: str, allowed_extensions: Iterable[str]) -> str:
     """把浏览器给的文件名清洗成安全、可跨平台保存的名字，同时保留中文。
 
@@ -53,15 +73,7 @@ def sanitize_filename(raw: str, allowed_extensions: Iterable[str]) -> str:
     if ext not in allowed:
         raise StorageError(f"不支持的文件格式: {ext or '未知'}")
 
-    stem = _ILLEGAL_CHARS.sub("_", stem).strip().strip(".")
-    if not stem:
-        stem = "image"
-    if stem.upper() in _RESERVED_NAMES:
-        stem = f"_{stem}"
-    # 末尾的点和空格在 Windows 上会被静默截断，先处理掉
-    stem = stem.rstrip(". ")[:_MAX_STEM_LEN].rstrip(". ") or "image"
-
-    return f"{stem}.{ext}"
+    return f"{_clean_stem(stem, 'image')}.{ext}"
 
 
 def resolve_within(base: Path, name: str) -> Path:

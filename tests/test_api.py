@@ -34,7 +34,7 @@ def test_upload_chinese_filename_survives(client, image_bytes):
 
 def test_upload_same_name_gets_suffix(client, image_bytes):
     upload(client, image_bytes(), "cat.png")
-    upload(client, image_bytes(), "cat.png")
+    upload(client, image_bytes(color=(10, 20, 30)), "cat.png")
     names = [item["filename"] for item in client.get("/api/images").get_json()["images"]]
     assert names == ["cat.png", "cat_1.png"]
 
@@ -121,12 +121,65 @@ def test_annotation_accepts_empty_box_list(client, image_bytes):
 
 def test_stats(client, image_bytes):
     upload(client, image_bytes(), "a.png")
-    upload(client, image_bytes(), "b.png")
+    upload(client, image_bytes(color=(1, 2, 3)), "b.png")
     client.put("/api/annotation/a.png", json={"boxes": []})
     payload = client.get("/api/stats").get_json()
     assert payload["total"] == 2
     assert payload["annotated"] == 1
     assert payload["pending"] == 1
+
+
+def test_duplicate_content_is_skipped(client, image_bytes):
+    first = upload(client, image_bytes(), "cat.png")
+    assert first.get_json()["count"] == 1
+
+    second = upload(client, image_bytes(), "另一个名字.png")
+    assert second.status_code == 400
+    payload = second.get_json()
+    assert payload["count"] == 0
+    assert payload["skipped"][0]["duplicate"] == "cat.png"
+    assert "重复" in payload["error"]
+
+    names = [item["filename"] for item in client.get("/api/images").get_json()["images"]]
+    assert names == ["cat.png"]
+
+
+def test_duplicate_detected_after_restart(data_dir, image_bytes):
+    first_app = create_app(data_dir)
+    first_client = first_app.test_client()
+    first_client.post(
+        "/api/upload",
+        data={"files": (image_bytes(), "cat.png")},
+        content_type="multipart/form-data",
+    )
+
+    second_app = create_app(data_dir)
+    second_client = second_app.test_client()
+    response = second_client.post(
+        "/api/upload",
+        data={"files": (image_bytes(), "换了名字.png")},
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 400
+    assert response.get_json()["skipped"][0]["duplicate"] == "cat.png"
+    assert second_client.get("/api/images").get_json()["count"] == 1
+
+
+def test_deleted_image_can_be_uploaded_again(client, image_bytes):
+    upload(client, image_bytes(), "cat.png")
+    client.post("/api/delete_images", json={"filenames": ["cat.png"]})
+    again = upload(client, image_bytes(), "cat.png")
+    assert again.status_code == 200
+    assert again.get_json()["count"] == 1
+
+
+def test_dedupe_can_be_disabled(client, image_bytes):
+    client.application.config["DEDUPE"] = False
+    upload(client, image_bytes(), "cat.png")
+    second = upload(client, image_bytes(), "cat-again.png")
+    assert second.status_code == 200
+    assert second.get_json()["count"] == 1
+    assert client.get("/api/images").get_json()["count"] == 2
 
 
 def test_export_returns_zip(client, image_bytes):

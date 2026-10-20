@@ -26,6 +26,7 @@ from werkzeug.exceptions import RequestEntityTooLarge
 
 from core import config
 from core.exporter import FORMAT_LABELS, SUPPORTED_FORMATS, ExportError, build_export
+from core.index import UploadIndex, bytes_sha256, file_sha256
 from core.inference import BatchRunner, InferenceError, ModelManager
 from core.storage import (
     AnnotationStore,
@@ -33,10 +34,12 @@ from core.storage import (
     StorageError,
     resolve_within,
     sanitize_filename,
+    sanitize_stem,
     unique_path,
 )
+from core.video import VIDEO_EXTENSIONS, VideoError, iter_frames, probe
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 
 def _clean_class_filter(raw) -> list[int] | None:
@@ -75,6 +78,9 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
     app.config.update(dirs)
     app.config["MAX_CONTENT_LENGTH"] = config.MAX_CONTENT_LENGTH
     app.config["ALLOWED_EXTENSIONS"] = config.ALLOWED_EXTENSIONS
+    app.config["MAX_IMAGE_BYTES"] = config.MAX_IMAGE_BYTES
+    app.config["MAX_VIDEO_BYTES"] = config.MAX_VIDEO_BYTES
+    app.config["DEDUPE"] = config.DEDUPE
     try:
         app.json.ensure_ascii = False
     except AttributeError:  # Flask < 2.2
@@ -85,10 +91,12 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
     store = AnnotationStore(app.config["ANNOTATION_DIR"])
     models = ModelManager(app.config["MODEL_DIR"])
     batch = BatchRunner(models, store, upload_dir)
+    upload_index = UploadIndex(root / "upload_index.json")
 
     app.extensions["store"] = store
     app.extensions["models"] = models
     app.extensions["batch"] = batch
+    app.extensions["upload_index"] = upload_index
 
     # ------------------------------------------------------------ 工具函数
 
@@ -112,6 +120,9 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
             return []
         names = [p.name for p in entries if p.is_file() and is_image_name(p.name)]
         return sorted(names, key=str.lower)
+
+    # 清理被外部删除的图片留下的哈希记录，避免误判「重复」而拒绝上传
+    upload_index.sync(set(list_image_names()))
 
     # ------------------------------------------------------------ 页面
 
@@ -153,15 +164,33 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
             tmp_path = upload_dir / f".upload-{uuid.uuid4().hex}.tmp"
             try:
                 storage_file.save(tmp_path)
-                if tmp_path.stat().st_size == 0:
+                size = tmp_path.stat().st_size
+                if size == 0:
                     raise StorageError("文件为空")
+                if size > app.config["MAX_IMAGE_BYTES"]:
+                    raise StorageError(f"图片超过 {config.MAX_IMAGE_MB} MB 上限")
+
+                # 内容去重：同一张图换个名字再传一次，不该变成两份数据
+                sha = file_sha256(tmp_path)
+                if app.config["DEDUPE"]:
+                    existing = upload_index.find(sha)
+                    if existing and (upload_dir / existing).exists():
+                        skipped.append(
+                            {
+                                "filename": raw_name,
+                                "reason": f"与已有图片重复：{existing}",
+                                "duplicate": existing,
+                            }
+                        )
+                        continue
 
                 # 只信任真实的图片内容，不信任扩展名
-                with Image.open(tmp_path) as probe:
-                    probe.verify()
+                with Image.open(tmp_path) as probe_image:
+                    probe_image.verify()
 
                 target = unique_path(upload_dir, safe_name)
                 os.replace(tmp_path, target)
+                upload_index.add(target.name, sha, size)
                 uploaded.append(
                     {
                         "filename": target.name,
@@ -175,8 +204,17 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
                 tmp_path.unlink(missing_ok=True)
 
         if not uploaded and skipped:
+            duplicates = [item for item in skipped if item.get("duplicate")]
             return (
-                jsonify(error="所有文件都上传失败", skipped=skipped, count=0),
+                jsonify(
+                    error=(
+                        f"{len(duplicates)} 个文件与已有图片重复"
+                        if len(duplicates) == len(skipped)
+                        else "所有文件都上传失败"
+                    ),
+                    skipped=skipped,
+                    count=0,
+                ),
                 400,
             )
 
@@ -186,6 +224,67 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
             skipped=skipped,
             count=len(uploaded),
         )
+
+    @app.post("/api/upload_video")
+    def upload_video():
+        """从视频按固定间隔抽帧，抽出的帧直接进图片列表。"""
+        storage_file = request.files.get("video")
+        if storage_file is None or not storage_file.filename:
+            return jsonify(error="没有选择视频文件"), 400
+
+        raw_name = storage_file.filename
+        ext = Path(raw_name.replace("\\", "/")).suffix.lower().lstrip(".")
+        if ext not in VIDEO_EXTENSIONS:
+            return jsonify(error=f"不支持的视频格式: {ext or '未知'}"), 400
+
+        interval = _float_value(request.form.get("interval"), 1.0)
+        max_frames = int(_float_value(request.form.get("max_frames"), 60))
+
+        # 用 ASCII 临时文件名，避免 OpenCV 在中文路径下打不开视频
+        tmp_path = upload_dir / f".video-{uuid.uuid4().hex}.{ext}"
+        try:
+            storage_file.save(tmp_path)
+            size = tmp_path.stat().st_size
+            if size == 0:
+                raise VideoError("视频文件为空")
+            if size > app.config["MAX_VIDEO_BYTES"]:
+                raise VideoError(f"视频超过 {config.MAX_VIDEO_MB} MB 上限")
+
+            meta = probe(tmp_path)
+            stem = sanitize_stem(raw_name, "video")
+
+            created: list[str] = []
+            duplicates = 0
+            for frame_index, data in iter_frames(
+                tmp_path, interval=interval, max_frames=max_frames
+            ):
+                sha = bytes_sha256(data)
+                existing = upload_index.find(sha)
+                if existing and (upload_dir / existing).exists():
+                    duplicates += 1
+                    continue
+
+                target = unique_path(upload_dir, f"{stem}_{frame_index:05d}.jpg")
+                target.write_bytes(data)
+                upload_index.add(target.name, sha, len(data))
+                created.append(target.name)
+
+            if not created and not duplicates:
+                raise VideoError("没有抽到任何帧，可能是视频损坏或编码不受支持")
+
+            return jsonify(
+                success=True,
+                count=len(created),
+                duplicates=duplicates,
+                frames=created,
+                video={
+                    "filename": raw_name,
+                    "size": size,
+                    **meta,
+                },
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     @app.get("/api/images")
     def get_images():
@@ -229,6 +328,7 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
             try:
                 path.unlink()
                 store.delete(path.name)
+                upload_index.remove(path.name)
                 deleted.append(path.name)
             except OSError:
                 continue
@@ -245,6 +345,7 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
             except OSError:
                 continue
         store.clear()
+        upload_index.clear()
         return jsonify(success=True, removed=removed)
 
     # ------------------------------------------------------------ 模型
@@ -457,6 +558,10 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
 
     @app.errorhandler(ExportError)
     def handle_export_error(exc):  # noqa: ANN001
+        return jsonify(error=str(exc)), 400
+
+    @app.errorhandler(VideoError)
+    def handle_video_error(exc):  # noqa: ANN001
         return jsonify(error=str(exc)), 400
 
     @app.errorhandler(RequestEntityTooLarge)
