@@ -2,7 +2,16 @@
 
 基于 **Flask + Ultralytics YOLO** 的浏览器端图像标注工具：把图片拖进来，模型先自动画框，你在网页上拖一拖改一改，最后一键导出**能直接拿去训练**的数据集（zip 直接下载）。
 
-> v0.3：新增视频抽帧导入与内容去重；v0.2 补齐了「标注」这件事缺失的另一半 —— 人工修正、结果落盘、导出下载。
+> v0.4：加入 SAM 点选与多边形标注，可导出 YOLO 分割数据集；v0.3 加入视频抽帧与内容去重；v0.2 补齐了「标注」这件事缺失的另一半 —— 人工修正、结果落盘、导出下载。
+
+## v0.4 更新了什么
+
+| 原问题 | 现在的行为 |
+| --- | --- |
+| 只能画矩形框，实例分割没法标 | 新增多边形工具：单击加点、点回首点/双击闭合、拖动顶点、Alt+点击删点 |
+| 手画多边形太慢，边缘还跟不上 | **SAM 点选**：在目标上点一下，自动生成贴边的精确轮廓（`mobile_sam`，CPU 约 1.5 秒） |
+| 导出的数据训练不了分割模型 | 新增 **YOLO SEG** 导出：`class x1 y1 x2 y2 …` 归一化多边形 + `task: segment` 的 `data.yaml` |
+| COCO 导出没有分割信息 | COCO 现在带 `segmentation` 多边形和真实多边形面积（鞋带公式），矩形框自动补四角 |
 
 ## v0.3 更新了什么
 
@@ -30,9 +39,11 @@
 ## 功能特性
 
 - **自动预标注**：内置 YOLOv8n/s/m/l/x 与 YOLOv5su，也可以上传自己的 `.pt` 权重
+- **SAM 点选**：在目标上点一下，`mobile_sam` 自动生成贴边轮廓，省掉手动描边
+- **多边形标注**：单击加点、闭合、拖动顶点、Alt+点击删点，支持任意形状
 - **视频抽帧**：直接选视频按固定间隔抽帧，静止画面自动跳过，不用先拿剪辑软件拆图
 - **上传去重**：按内容哈希判重，同一张图重复上传只保留一份
-- **可编辑标注**：拖拽移动、八向缩放、空白处框选新建、Delete 删除、下拉改类别、Ctrl+Z 撤销
+- **可编辑标注**：矩形框拖拽/八向缩放、多边形顶点编辑、Delete 删除、下拉改类别、Ctrl+Z 撤销
 - **类别过滤**：只输出关心的类别，避免把整张图的椅子、杯子都标出来
 - **批量标注**：服务端任务队列，进度条 + 失败原因，可中途取消
 - **多格式导出**：YOLO TXT / YOLO JSON / COCO JSON / Pascal VOC，全部打包成 zip
@@ -68,7 +79,7 @@ Windows 下也可以直接双击 `start.bat`：它会检查依赖、清理占用
 2. **导入视频**（可选）：点「视频抽帧」，选视频与抽帧间隔，抽出的帧会直接加进列表
 3. **加载模型**：下拉选一个预训练模型，点「加载模型」
 4. **自动标注**：`标注当前图` 只跑当前这张，`批量标注` 跑所有未标注的图（勾「重标全部」则全部重跑）
-5. **人工修正**：拖框、拉控制点、空白处画新框、在右侧「标注」面板改类别
+5. **人工修正 / 分割**：拖框改矩形；切到「多边形」手画轮廓，或切到「SAM」在目标上点一下自动生成
 6. **导出**：点「导出」，选格式与选项，浏览器直接下载 zip
 
 标注过程中不需要点保存：改动后 0.45 秒自动落盘，右下角会显示「已保存 / 保存中 / 保存失败」。
@@ -77,28 +88,35 @@ Windows 下也可以直接双击 `start.bat`：它会检查依赖、清理占用
 
 | 操作 | 效果 |
 | --- | --- |
-| 在空白处拖动 | 新建检测框 |
-| 拖动框内部 | 移动检测框 |
-| 拖动 8 个控制点 | 缩放检测框 |
-| `Delete` / `Backspace` | 删除选中的框 |
+| `B` / `P` / `S` | 切换 框选 / 多边形 / SAM 工具 |
+| 框选：在空白处拖动 | 新建矩形框 |
+| 框选：拖动框内部 / 控制点 | 移动 / 缩放矩形框 |
+| 多边形：单击 | 添加顶点 |
+| 多边形：点回首点、双击或 `Enter` | 闭合多边形 |
+| 多边形：拖动顶点 | 调整形状 |
+| 多边形：`Alt` + 点击顶点 | 删除该顶点（至少保留 3 个） |
+| SAM：单击目标 | 自动生成精确轮廓 |
+| `Delete` / `Backspace` | 删除选中的形状 |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | 撤销 / 重做 |
 | `Ctrl+S` | 立即保存 |
 | 方向键（按住 `Shift` 加速） | 以像素为单位微调位置 |
-| `1`–`9` | 给选中的框切换成第 N 个类别 |
+| `1`–`9` | 给选中的形状切换成第 N 个类别 |
 | `空格` + 拖动 / 中键拖动 | 平移画布 |
 | 滚轮 | 以光标为中心缩放 |
 | `F` | 适应窗口 |
 | `PageUp` / `PageDown` | 上一张 / 下一张 |
+| `Esc` | 取消正在画的多边形 / 取消选中 |
 | `H` | 快捷键帮助 |
 
 ## 导出格式
 
 | 格式 | 产出内容 | 说明 |
 | --- | --- | --- |
-| **YOLO TXT** | `labels/{train,val}/*.txt`、`images/`、`classes.txt`、`data.yaml`、`README.txt` | 归一化 `class cx cy w h`，解压即可训练 |
-| **YOLO JSON** | `labels/*.json` + `classes.txt` | 每图一个 JSON，绝对坐标 `xyxy` |
-| **COCO JSON** | `annotations/instances.json`、`images/`、`classes.txt` | 单文件全量，类别 id 稳定且从 1 连续编号 |
-| **Pascal VOC** | `Annotations/*.xml`、`JPEGImages/`、`classes.txt` | 绝对坐标 `xmin/ymin/xmax/ymax` |
+| **YOLO TXT** | `labels/{train,val}/*.txt`、`images/`、`classes.txt`、`data.yaml`、`README.txt` | 归一化 `class cx cy w h`，解压即可训练检测模型 |
+| **YOLO SEG** | 同上，但标注是多边形 | `class x1 y1 x2 y2 …`，`data.yaml` 带 `task: segment` |
+| **YOLO JSON** | `labels/*.json` + `classes.txt` | 每图一个 JSON，绝对坐标，含 `polygons` |
+| **COCO JSON** | `annotations/instances.json`、`images/`、`classes.txt` | 带 `segmentation` 多边形与多边形面积 |
+| **Pascal VOC** | `Annotations/*.xml`、`JPEGImages/`、`classes.txt` | 绝对坐标 `xmin/ymin/xmax/ymax`（多边形取外接框） |
 
 导出选项：
 
@@ -111,7 +129,11 @@ Windows 下也可以直接双击 `start.bat`：它会检查依赖、清理占用
 ```bash
 unzip yolo_txt_20261020_153000.zip -d dataset
 cd dataset
+
+# 检测
 yolo detect train data=data.yaml model=yolov8n.pt imgsz=640 epochs=100
+# 分割（用 YOLO SEG 导出的包）
+yolo segment train data=data.yaml model=yolov8n-seg.pt imgsz=640 epochs=100
 ```
 
 ## API 一览
@@ -130,6 +152,9 @@ yolo detect train data=data.yaml model=yolov8n.pt imgsz=640 epochs=100
 | POST | `/api/load_model` | 加载模型，返回类别表 |
 | GET | `/api/classes` | 当前模型的类别表 |
 | POST | `/api/annotate` | 单图推理并落盘 |
+| GET | `/api/sam/status` | SAM 是否已加载 |
+| POST | `/api/sam/load` | 预加载 SAM 权重 |
+| POST | `/api/sam` | 点选提示 → 返回轮廓多边形 |
 | GET | `/api/annotation/<filename>` | 读取某图标注 |
 | PUT | `/api/annotation/<filename>` | 保存人工修正后的标注 |
 | POST | `/api/batch` | 创建批量标注任务 |
@@ -158,7 +183,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-覆盖文件名清洗、路径穿越、标注落盘与重启回填、四种导出格式的坐标换算、类别重编号、train/val 划分稳定性、内容去重、视频抽帧，以及全部 HTTP 接口（64 个用例，不需要 GPU 或模型权重）。
+覆盖文件名清洗、路径穿越、标注落盘与重启回填、多边形规范化、五种导出格式的坐标换算、类别重编号、train/val 划分稳定性、内容去重、视频抽帧、SAM 接口，以及全部 HTTP 接口（83 个用例，不需要 GPU 或模型权重）。
 
 ## 项目结构
 
@@ -170,6 +195,7 @@ yolo-tool/
 │   ├── storage.py          # 文件名安全 + 标注持久化（AnnotationStore）
 │   ├── index.py            # 内容哈希去重索引（UploadIndex）
 │   ├── video.py            # 视频抽帧（OpenCV）
+│   ├── sam.py              # SAM 点选 → 轮廓多边形
 │   ├── inference.py        # 模型加载、单图推理、批量任务（BatchRunner）
 │   └── exporter.py         # 四种格式导出 + zip 打包
 ├── templates/index.html    # 页面结构
@@ -189,15 +215,16 @@ yolo-tool/
 
 ## 已知限制
 
-- 只支持矩形框（bbox），多边形/分割标注尚未实现
+- 分割标注只导出多边形顶点，不导出掩膜位图（RLE/PNG mask）
+- SAM 首次使用需要下载约 40 MB 权重，CPU 上单点约 1–2 秒
 - 单进程、单任务：批量标注同时只能跑一个，适合个人或小团队本地使用
 - 没有鉴权，默认只监听 `127.0.0.1`，**不要直接暴露到公网**
 - 去重只比较完全相同的字节；同一张图另存为不同压缩率仍会各存一份
 
 ## 后续计划
 
-- YOLOv8-seg 掩膜 / 多边形标注
-- SAM 辅助：点一下目标自动生成精确轮廓
+- 掩膜位图导出（COCO RLE / PNG mask）
+- SAM 支持负点与框提示，处理遮挡与粘连目标
 - 主动学习：按置信度排序，优先人工复核低分框
 - 感知哈希去重（识别「同一张图不同压缩率」的近似重复）
 - ONNX / 半精度推理，CPU 上再快一截

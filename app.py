@@ -28,6 +28,7 @@ from core import config
 from core.exporter import FORMAT_LABELS, SUPPORTED_FORMATS, ExportError, build_export
 from core.index import UploadIndex, bytes_sha256, file_sha256
 from core.inference import BatchRunner, InferenceError, ModelManager
+from core.sam import SamAssistant, SamError
 from core.storage import (
     AnnotationStore,
     PathTraversalError,
@@ -39,7 +40,7 @@ from core.storage import (
 )
 from core.video import VIDEO_EXTENSIONS, VideoError, iter_frames, probe
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 
 def _clean_class_filter(raw) -> list[int] | None:
@@ -92,11 +93,13 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
     models = ModelManager(app.config["MODEL_DIR"])
     batch = BatchRunner(models, store, upload_dir)
     upload_index = UploadIndex(root / "upload_index.json")
+    sam = SamAssistant(app.config["MODEL_DIR"])
 
     app.extensions["store"] = store
     app.extensions["models"] = models
     app.extensions["batch"] = batch
     app.extensions["upload_index"] = upload_index
+    app.extensions["sam"] = sam
 
     # ------------------------------------------------------------ 工具函数
 
@@ -382,6 +385,50 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
     def get_classes():
         return jsonify(classes=models.classes(), model=models.model_name)
 
+    # ------------------------------------------------------------ SAM 辅助
+
+    @app.get("/api/sam/status")
+    def sam_status():
+        return jsonify(sam.status())
+
+    @app.post("/api/sam/load")
+    def sam_load():
+        payload = request.get_json(silent=True) or {}
+        name = sam.load(payload.get("model_name"))
+        return jsonify(success=True, model=name, **sam.status())
+
+    @app.post("/api/sam")
+    def sam_segment():
+        """点选提示 → 返回该目标的轮廓多边形（原图像素坐标）。"""
+        payload = request.get_json(silent=True) or {}
+        filename = payload.get("filename")
+        if not filename:
+            return jsonify(error="缺少图片文件名"), 400
+
+        path = image_path(str(filename))
+
+        raw_points = payload.get("points")
+        points: list[list[float]] = []
+        if isinstance(raw_points, (list, tuple)):
+            for pair in raw_points:
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                try:
+                    points.append([float(pair[0]), float(pair[1])])
+                except (TypeError, ValueError):
+                    continue
+        if not points:
+            return jsonify(error="缺少提示点"), 400
+
+        labels = payload.get("labels")
+        if isinstance(labels, (list, tuple)) and len(labels) == len(points):
+            parsed_labels = [1 if int(value) else 0 for value in labels]
+        else:
+            parsed_labels = [1] * len(points)
+
+        polygons = sam.segment(path, points, parsed_labels)
+        return jsonify(success=True, polygons=polygons, count=len(polygons))
+
     # ------------------------------------------------------------ 标注
 
     @app.get("/api/annotation/<path:filename>")
@@ -562,6 +609,10 @@ def create_app(data_dir: Path | str | None = None) -> Flask:
 
     @app.errorhandler(VideoError)
     def handle_video_error(exc):  # noqa: ANN001
+        return jsonify(error=str(exc)), 400
+
+    @app.errorhandler(SamError)
+    def handle_sam_error(exc):  # noqa: ANN001
         return jsonify(error=str(exc)), 400
 
     @app.errorhandler(RequestEntityTooLarge)

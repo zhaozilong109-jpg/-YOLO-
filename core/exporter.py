@@ -17,15 +17,17 @@ from xml.sax.saxutils import escape
 
 from .storage import resolve_within
 
-YOLO_FORMATS = {"yolo_txt", "yolo_json"}
+YOLO_FORMATS = {"yolo_txt", "yolo_json", "yolo_seg"}
 SUPPORTED_FORMATS = {
     "yolo_txt",
+    "yolo_seg",
     "yolo_json",
     "coco_json",
     "pascal_voc",
 }
 FORMAT_LABELS = {
     "yolo_txt": "YOLO TXT",
+    "yolo_seg": "YOLO SEG",
     "yolo_json": "YOLO JSON",
     "coco_json": "COCO JSON",
     "pascal_voc": "Pascal VOC",
@@ -41,6 +43,49 @@ class ExportError(RuntimeError):
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _clean_polygon(raw_points, img_w: float, img_h: float) -> list[list[float]] | None:
+    """把多边形顶点裁剪到图像范围，少于 3 点视为无效。"""
+    if not isinstance(raw_points, (list, tuple)):
+        return None
+
+    points: list[list[float]] = []
+    for pair in raw_points:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            x = float(pair[0])
+            y = float(pair[1])
+        except (TypeError, ValueError):
+            continue
+        if img_w > 0:
+            x = _clamp(x, 0, img_w)
+        if img_h > 0:
+            y = _clamp(y, 0, img_h)
+        points.append([x, y])
+
+    return points if len(points) >= 3 else None
+
+
+def polygon_of(box: dict) -> list[list[float]]:
+    """取多边形的顶点；矩形框则返回它的四个角。"""
+    return box.get("points") or [
+        [box["x1"], box["y1"]],
+        [box["x2"], box["y1"]],
+        [box["x2"], box["y2"]],
+        [box["x1"], box["y2"]],
+    ]
+
+
+def polygon_area(points: list[list[float]]) -> float:
+    """鞋带公式求多边形面积。"""
+    total = 0.0
+    for index in range(len(points)):
+        x1, y1 = points[index]
+        x2, y2 = points[(index + 1) % len(points)]
+        total += x1 * y2 - x2 * y1
+    return abs(total) / 2
 
 
 def normalised_boxes(annotation: dict) -> list[dict]:
@@ -72,17 +117,19 @@ def normalised_boxes(annotation: dict) -> list[dict]:
         if x2 - x1 < 1 or y2 - y1 < 1:
             continue
 
-        result.append(
-            {
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-                "class_id": int(raw.get("class_id", 0)),
-                "class_name": str(raw.get("class_name") or "object"),
-                "confidence": float(raw.get("confidence", 1.0)),
-            }
-        )
+        item = {
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "class_id": int(raw.get("class_id", 0)),
+            "class_name": str(raw.get("class_name") or "object"),
+            "confidence": float(raw.get("confidence", 1.0)),
+        }
+        points = _clean_polygon(raw.get("points"), img_w, img_h)
+        if points:
+            item["points"] = points
+        result.append(item)
     return result
 
 
@@ -156,8 +203,34 @@ def yolo_label_text(annotation: dict, id_map: dict[int, int]) -> str:
     return "\n".join(lines)
 
 
+def yolo_seg_text(annotation: dict, id_map: dict[int, int]) -> str:
+    """YOLO 分割标注：``class x1 y1 x2 y2 ...``（归一化多边形顶点）。
+
+    矩形框也能导出——按四个角当作四边形处理。
+    """
+    img_w = float(annotation.get("img_w") or 0)
+    img_h = float(annotation.get("img_h") or 0)
+    if img_w <= 0 or img_h <= 0:
+        return ""
+
+    lines = []
+    for box in normalised_boxes(annotation):
+        if box["class_id"] not in id_map:
+            continue
+
+        coords = []
+        for x, y in polygon_of(box):
+            coords.append(f"{_clamp(x / img_w, 0.0, 1.0):.6f}")
+            coords.append(f"{_clamp(y / img_h, 0.0, 1.0):.6f}")
+        if len(coords) < 6:
+            continue
+
+        lines.append(f"{id_map[box['class_id']]} " + " ".join(coords))
+    return "\n".join(lines)
+
+
 def yolo_json_document(filename: str, annotation: dict) -> dict:
-    return {
+    document = {
         "version": "1.0",
         "filename": filename,
         "image_width": int(annotation.get("img_w") or 0),
@@ -177,6 +250,20 @@ def yolo_json_document(filename: str, annotation: dict) -> dict:
             for box in normalised_boxes(annotation)
         ],
     }
+
+    # 有多边形就一并带上，消费方按需取用
+    polygons = [
+        {
+            "class_id": box["class_id"],
+            "class_name": box["class_name"],
+            "points": [[round(x, 2), round(y, 2)] for x, y in box["points"]],
+        }
+        for box in normalised_boxes(annotation)
+        if box.get("points")
+    ]
+    if polygons:
+        document["polygons"] = polygons
+    return document
 
 
 def coco_document(
@@ -202,6 +289,17 @@ def coco_document(
                 continue
             width = box["x2"] - box["x1"]
             height = box["y2"] - box["y1"]
+            polygon = box.get("points")
+            segmentation = (
+                [[round(coord, 2) for point in polygon for coord in point]]
+                if polygon
+                else [[
+                    round(box["x1"], 2), round(box["y1"], 2),
+                    round(box["x2"], 2), round(box["y1"], 2),
+                    round(box["x2"], 2), round(box["y2"], 2),
+                    round(box["x1"], 2), round(box["y2"], 2),
+                ]]
+            )
             anns.append(
                 {
                     "id": ann_id,
@@ -213,7 +311,10 @@ def coco_document(
                         round(width, 2),
                         round(height, 2),
                     ],
-                    "area": round(width * height, 2),
+                    "area": round(
+                        polygon_area(polygon) if polygon else width * height, 2
+                    ),
+                    "segmentation": segmentation,
                     "iscrowd": 0,
                 }
             )
@@ -284,16 +385,20 @@ def _classes_txt(names: list[str]) -> str:
     return "\n".join(names) + ("\n" if names else "")
 
 
-def _data_yaml(names: list[str]) -> str:
+def _data_yaml(names: list[str], task: str | None = None) -> str:
     quoted = json.dumps(names, ensure_ascii=False)
-    return (
-        "# 由 YOLO 智能标注工具生成\n"
-        "path: .\n"
-        "train: images/train\n"
-        "val: images/val\n"
-        f"nc: {len(names)}\n"
-        f"names: {quoted}\n"
-    )
+    lines = ["# 由 YOLO 智能标注工具生成"]
+    if task:
+        lines.append(f"task: {task}")
+    lines += [
+        "path: .",
+        "train: images/train",
+        "val: images/val",
+        f"nc: {len(names)}",
+        f"names: {quoted}",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def _read_image(upload_dir: Path, filename: str) -> bytes | None:
@@ -346,6 +451,24 @@ def build_export(
             names, include_images, val_ratio, has_val
         ).encode("utf-8")
 
+    elif fmt == "yolo_seg":
+        has_val = False
+        for filename, annotation in sorted(annotations.items()):
+            split = "val" if _is_val(filename, val_ratio) else "train"
+            has_val = has_val or split == "val"
+            label = yolo_seg_text(annotation, id_map)
+            files[f"labels/{split}/{_stem(filename)}.txt"] = label.encode("utf-8")
+            if include_images:
+                content = _read_image(upload_dir, filename)
+                if content is not None:
+                    files[f"images/{split}/{filename}"] = content
+
+        files["classes.txt"] = _classes_txt(names).encode("utf-8")
+        files["data.yaml"] = _data_yaml(names, task="segment").encode("utf-8")
+        files["README.txt"] = _dataset_readme(
+            names, include_images, val_ratio, has_val, task="segment"
+        ).encode("utf-8")
+
     elif fmt == "yolo_json":
         for filename, annotation in sorted(annotations.items()):
             document = yolo_json_document(filename, annotation)
@@ -391,8 +514,19 @@ def build_export(
 
 
 def _dataset_readme(
-    names: list[str], include_images: bool, val_ratio: float, has_val: bool
+    names: list[str],
+    include_images: bool,
+    val_ratio: float,
+    has_val: bool,
+    task: str = "detect",
 ) -> str:
+    if task == "segment":
+        label_line = "  labels/train, labels/val   对应的 YOLO 分割标注（class x1 y1 x2 y2 …，归一化）"
+        train_line = "  yolo segment train data=data.yaml model=yolov8n-seg.pt imgsz=640 epochs=100"
+    else:
+        label_line = "  labels/train, labels/val   对应的 YOLO 标注（class cx cy w h，归一化）"
+        train_line = "  yolo detect train data=data.yaml model=yolov8n.pt imgsz=640 epochs=100"
+
     lines = [
         "YOLO 智能标注工具 —— 数据集导出说明",
         "=" * 40,
@@ -401,7 +535,7 @@ def _dataset_readme(
         "",
         "目录结构:",
         "  images/train, images/val   原始图片",
-        "  labels/train, labels/val   对应的 YOLO 标注（class cx cy w h，归一化）",
+        label_line,
         "  data.yaml                  ultralytics 训练配置",
         "  classes.txt                类别名，行号即 class id",
         "",
@@ -420,7 +554,7 @@ def _dataset_readme(
     lines += [
         "",
         "训练示例:",
-        "  yolo detect train data=data.yaml model=yolov8n.pt imgsz=640 epochs=100",
+        train_line,
         "",
     ]
     return "\n".join(lines)

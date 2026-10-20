@@ -346,6 +346,49 @@ button:focus-visible {
     text-align: right;
 }
 
+.tool-switch {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    overflow: hidden;
+    flex: 0 0 auto;
+}
+
+.tool-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 3px 10px;
+    font-size: 11.5px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.tool-btn + .tool-btn {
+    border-left: 1px solid var(--border);
+}
+
+.tool-btn:hover {
+    color: var(--text);
+}
+
+.tool-btn.active {
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+#viewport.tool-polygon {
+    cursor: crosshair;
+}
+
+#viewport.tool-sam {
+    cursor: cell;
+}
+
+#viewport.sam-busy {
+    cursor: progress;
+}
+
 .save-state.saved {
     color: var(--ok);
 }

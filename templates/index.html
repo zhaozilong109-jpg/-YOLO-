@@ -72,8 +72,13 @@
                 <span id="boxCount">0 个框</span>
                 <span class="dot">·</span>
                 <span id="zoomLabel">100%</span>
+                <span class="tool-switch" role="group" aria-label="标注工具">
+                    <button class="tool-btn active" data-tool="box" title="矩形框（B）">框选</button>
+                    <button class="tool-btn" data-tool="polygon" title="多边形（P）">多边形</button>
+                    <button class="tool-btn" data-tool="sam" title="SAM 点选（S）">SAM</button>
+                </span>
                 <span class="spacer"></span>
-                <span class="hint">拖空白处画框 · 拖动框移动 · 空格或中键平移 · 滚轮缩放</span>
+                <span class="hint" id="toolHint">拖空白处画框 · 拖动框移动 · 空格或中键平移 · 滚轮缩放</span>
                 <span id="saveState" class="save-state">—</span>
             </footer>
         </section>
@@ -202,7 +207,13 @@
             <tr><td>拖动空白</td><td>新建检测框</td></tr>
             <tr><td>拖动框内</td><td>移动检测框</td></tr>
             <tr><td>拖动控制点</td><td>缩放检测框</td></tr>
-            <tr><td>Delete / Backspace</td><td>删除选中的框</td></tr>
+            <tr><td>B / P / S</td><td>切换 框选 / 多边形 / SAM</td></tr>
+            <tr><td>多边形：单击</td><td>添加顶点</td></tr>
+            <tr><td>多边形：点回首点 / 双击 / Enter</td><td>闭合多边形</td></tr>
+            <tr><td>多边形：拖动顶点</td><td>调整形状</td></tr>
+            <tr><td>多边形：Alt + 点击顶点</td><td>删除该顶点</td></tr>
+            <tr><td>SAM：单击目标</td><td>自动生成精确轮廓</td></tr>
+            <tr><td>Delete / Backspace</td><td>删除选中的形状</td></tr>
             <tr><td>Ctrl + Z / Ctrl + Shift + Z</td><td>撤销 / 重做</td></tr>
             <tr><td>Ctrl + S</td><td>立即保存</td></tr>
             <tr><td>方向键（Shift 加速）</td><td>微调位置</td></tr>

@@ -17,14 +17,17 @@
     ];
 
     const MIN_BOX_PX = 3;          // 小于这个尺寸的框不创建（原图像素）
-    const HANDLE_SIZE = 8;         // 控制点判定半径（屏幕像素）
+    const HANDLE_SIZE = 8;         // 控制点边长（屏幕像素）
+    const VERTEX_HIT = 7;          // 多边形顶点的命中半径
+    const CLOSE_HIT = 10;          // 点回首点闭合多边形的命中半径
     const HISTORY_LIMIT = 100;
     const SAVE_DELAY = 450;
 
     const FORMATS = [
         { value: 'yolo_txt', label: 'YOLO TXT', desc: 'labels/ + data.yaml，可直接训练' },
+        { value: 'yolo_seg', label: 'YOLO SEG', desc: '分割标注，多边形顶点归一化' },
         { value: 'yolo_json', label: 'YOLO JSON', desc: '每图一个 JSON，绝对坐标' },
-        { value: 'coco_json', label: 'COCO JSON', desc: '单个 instances.json，通用格式' },
+        { value: 'coco_json', label: 'COCO JSON', desc: '带 segmentation 的通用格式' },
         { value: 'pascal_voc', label: 'Pascal VOC', desc: '每图一个 XML，绝对坐标' },
     ];
 
@@ -54,6 +57,11 @@
         space: false,
         userZoomed: false,
         exportFormat: 'yolo_txt',
+        tool: 'box',
+        draft: null,
+        hoverPoint: null,
+        samReady: false,
+        samBusy: false,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -211,6 +219,8 @@
         if (state.drag && state.drag.type === 'new' && state.drag.temp) {
             drawBox(normaliseBox(state.drag.temp), true, true);
         }
+
+        drawDraft();
     }
 
     function normaliseBox(box) {
@@ -223,7 +233,40 @@
         };
     }
 
+    function isPolygon(shape) {
+        return Array.isArray(shape.points) && shape.points.length >= 3;
+    }
+
+    function boundsOf(points) {
+        const xs = points.map((point) => point[0]);
+        const ys = points.map((point) => point[1]);
+        return {
+            x1: Math.min(...xs),
+            y1: Math.min(...ys),
+            x2: Math.max(...xs),
+            y2: Math.max(...ys),
+        };
+    }
+
+    function pointInPolygon(points, x, y) {
+        let inside = false;
+        for (let i = 0, j = points.length - 1; i < points.length; j = i, i += 1) {
+            const [xi, yi] = points[i];
+            const [xj, yj] = points[j];
+            const crosses = yi > y !== yj > y;
+            if (crosses && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+
     function drawBox(box, selected, provisional = false) {
+        if (isPolygon(box)) {
+            drawPolygon(box, selected, provisional);
+            return;
+        }
+
         const rect = normaliseBox(box);
         const topLeft = imgToScreen(rect.x1, rect.y1);
         const width = (rect.x2 - rect.x1) * state.view.scale;
@@ -232,49 +275,145 @@
             return;
         }
 
-        const color = colorFor(box.class_id);
         ctx.save();
         ctx.lineWidth = selected ? 2.5 : 1.8;
-        ctx.strokeStyle = color;
+        ctx.strokeStyle = colorFor(box.class_id);
         ctx.setLineDash(provisional ? [5, 4] : []);
         ctx.strokeRect(topLeft.x, topLeft.y, width, height);
         ctx.setLineDash([]);
 
+        drawLabel(box, rect, provisional);
+        if (selected) {
+            drawHandles(handlePositions(rect));
+        }
+        ctx.restore();
+    }
+
+    function drawPolygon(box, selected, provisional = false) {
+        const screen = box.points.map(([x, y]) => imgToScreen(x, y));
+        const color = colorFor(box.class_id);
+
+        ctx.save();
+        ctx.beginPath();
+        screen.forEach((point, index) => {
+            if (index === 0) {
+                ctx.moveTo(point.x, point.y);
+            } else {
+                ctx.lineTo(point.x, point.y);
+            }
+        });
+        ctx.closePath();
+
+        ctx.globalAlpha = provisional ? 0.12 : 0.2;
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+
+        ctx.lineWidth = selected ? 2.5 : 1.8;
+        ctx.strokeStyle = color;
+        ctx.setLineDash(provisional ? [5, 4] : []);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        drawLabel(box, normaliseBox(box), provisional);
+
+        if (selected) {
+            screen.forEach((point, index) => {
+                const size = index === 0 ? HANDLE_SIZE + 2 : HANDLE_SIZE - 1;
+                ctx.fillStyle = index === 0 ? '#ffffff' : '#0f1115';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.2;
+                ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+                ctx.strokeRect(point.x - size / 2, point.y - size / 2, size, size);
+            });
+        }
+        ctx.restore();
+    }
+
+    function drawLabel(box, rect, provisional = false) {
+        const topLeft = imgToScreen(rect.x1, rect.y1);
         const label = `${box.class_name || classNameOf(box.class_id)}${
             box.confidence < 0.999 ? ` ${(box.confidence * 100).toFixed(0)}%` : ''
         }`;
+
         ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
         const textWidth = ctx.measureText(label).width;
         const chipHeight = 18;
         const above = topLeft.y >= chipHeight;
         const chipY = above ? topLeft.y - chipHeight : topLeft.y;
 
-        ctx.fillStyle = color;
+        ctx.fillStyle = colorFor(box.class_id);
         ctx.globalAlpha = provisional ? 0.7 : 0.92;
         ctx.fillRect(topLeft.x, chipY, textWidth + 10, chipHeight);
         ctx.globalAlpha = 1;
         ctx.fillStyle = '#fff';
         ctx.fillText(label, topLeft.x + 5, chipY + 13);
+    }
 
-        if (selected) {
-            ctx.fillStyle = '#0f1115';
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 1.5;
-            handlePositions(rect).forEach((point) => {
-                ctx.fillRect(
-                    point.x - HANDLE_SIZE / 2,
-                    point.y - HANDLE_SIZE / 2,
-                    HANDLE_SIZE,
-                    HANDLE_SIZE
-                );
-                ctx.strokeRect(
-                    point.x - HANDLE_SIZE / 2,
-                    point.y - HANDLE_SIZE / 2,
-                    HANDLE_SIZE,
-                    HANDLE_SIZE
-                );
-            });
+    function drawHandles(points) {
+        ctx.fillStyle = '#0f1115';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1.5;
+        points.forEach((point) => {
+            ctx.fillRect(
+                point.x - HANDLE_SIZE / 2,
+                point.y - HANDLE_SIZE / 2,
+                HANDLE_SIZE,
+                HANDLE_SIZE
+            );
+            ctx.strokeRect(
+                point.x - HANDLE_SIZE / 2,
+                point.y - HANDLE_SIZE / 2,
+                HANDLE_SIZE,
+                HANDLE_SIZE
+            );
+        });
+    }
+
+    function drawDraft() {
+        const draft = state.draft;
+        if (!draft || !draft.points.length) {
+            return;
         }
+        const screen = draft.points.map(([x, y]) => imgToScreen(x, y));
+        const preview = state.hoverPoint ? imgToScreen(state.hoverPoint.x, state.hoverPoint.y) : null;
+
+        ctx.save();
+        ctx.strokeStyle = '#22d3ee';
+        ctx.lineWidth = 1.8;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        screen.forEach((point, index) => {
+            if (index === 0) {
+                ctx.moveTo(point.x, point.y);
+            } else {
+                ctx.lineTo(point.x, point.y);
+            }
+        });
+        if (preview) {
+            ctx.lineTo(preview.x, preview.y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        if (screen.length >= 3 && preview) {
+            ctx.globalAlpha = 0.35;
+            ctx.strokeStyle = '#22d3ee';
+            ctx.beginPath();
+            ctx.moveTo(screen[0].x, screen[0].y);
+            ctx.lineTo(preview.x, preview.y);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+        }
+
+        screen.forEach((point, index) => {
+            const size = index === 0 ? HANDLE_SIZE + 2 : HANDLE_SIZE - 1;
+            ctx.fillStyle = index === 0 ? '#22d3ee' : '#0f1115';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.2;
+            ctx.fillRect(point.x - size / 2, point.y - size / 2, size, size);
+            ctx.strokeRect(point.x - size / 2, point.y - size / 2, size, size);
+        });
         ctx.restore();
     }
 
@@ -296,6 +435,9 @@
     }
 
     function hitHandle(box, sx, sy) {
+        if (isPolygon(box)) {
+            return -1;
+        }
         const points = handlePositions(normaliseBox(box));
         for (let i = 0; i < points.length; i += 1) {
             if (
@@ -308,10 +450,34 @@
         return -1;
     }
 
-    function hitBox(sx, sy) {
+    function hitVertex(shape, sx, sy) {
+        if (!isPolygon(shape)) {
+            return -1;
+        }
+        for (let index = 0; index < shape.points.length; index += 1) {
+            const point = imgToScreen(shape.points[index][0], shape.points[index][1]);
+            if (
+                Math.abs(point.x - sx) <= VERTEX_HIT &&
+                Math.abs(point.y - sy) <= VERTEX_HIT
+            ) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    function hitShape(sx, sy) {
         const boxes = state.annotation.boxes;
+        const imagePoint = screenToImg(sx, sy);
         for (let i = boxes.length - 1; i >= 0; i -= 1) {
-            const rect = normaliseBox(boxes[i]);
+            const shape = boxes[i];
+            if (isPolygon(shape)) {
+                if (pointInPolygon(shape.points, imagePoint.x, imagePoint.y)) {
+                    return i;
+                }
+                continue;
+            }
+            const rect = normaliseBox(shape);
             const a = imgToScreen(rect.x1, rect.y1);
             const b = imgToScreen(rect.x2, rect.y2);
             if (sx >= a.x && sx <= b.x && sy >= a.y && sy <= b.y) {
@@ -450,7 +616,73 @@
         }
 
         const boxes = state.annotation.boxes;
+        const imagePoint = screenToImg(pos.x, pos.y);
 
+        // SAM：单击即取轮廓
+        if (state.tool === 'sam') {
+            samSegment(imagePoint);
+            return;
+        }
+
+        // 选中的多边形优先处理顶点拖动 / Alt+点击删点
+        if (state.selected >= 0 && boxes[state.selected]) {
+            const vertex = hitVertex(boxes[state.selected], pos.x, pos.y);
+            if (vertex >= 0) {
+                if (event.altKey) {
+                    removeVertex(state.selected, vertex);
+                    return;
+                }
+                state.drag = {
+                    type: 'vertex',
+                    index: state.selected,
+                    vertex,
+                    before: snapshot(),
+                };
+                canvas.setPointerCapture(event.pointerId);
+                return;
+            }
+        }
+
+        // 多边形：单击加点，点回首点闭合
+        if (state.tool === 'polygon') {
+            if (state.draft) {
+                const first = state.draft.points[0];
+                const firstScreen = imgToScreen(first[0], first[1]);
+                if (
+                    state.draft.points.length >= 3 &&
+                    Math.abs(firstScreen.x - pos.x) <= CLOSE_HIT &&
+                    Math.abs(firstScreen.y - pos.y) <= CLOSE_HIT
+                ) {
+                    closeDraft();
+                    return;
+                }
+                addDraftPoint(imagePoint);
+                return;
+            }
+
+            const hitPolygon = hitShape(pos.x, pos.y);
+            if (hitPolygon >= 0) {
+                selectBox(hitPolygon);
+                const shape = boxes[hitPolygon];
+                state.drag = {
+                    type: 'move',
+                    index: hitPolygon,
+                    start: imagePoint,
+                    before: snapshot(),
+                    orig: { ...normaliseBox(shape) },
+                    origPoints: isPolygon(shape)
+                        ? shape.points.map((point) => [...point])
+                        : null,
+                };
+                canvas.setPointerCapture(event.pointerId);
+                return;
+            }
+
+            startDraft(imagePoint);
+            return;
+        }
+
+        // 矩形框：先判断缩放手柄
         if (state.selected >= 0 && boxes[state.selected]) {
             const handle = hitHandle(boxes[state.selected], pos.x, pos.y);
             if (handle >= 0) {
@@ -466,32 +698,33 @@
             }
         }
 
-        const hit = hitBox(pos.x, pos.y);
+        const hit = hitShape(pos.x, pos.y);
         if (hit >= 0) {
             selectBox(hit);
+            const shape = boxes[hit];
             state.drag = {
                 type: 'move',
                 index: hit,
-                start: screenToImg(pos.x, pos.y),
+                start: imagePoint,
                 before: snapshot(),
-                orig: { ...normaliseBox(boxes[hit]) },
+                orig: { ...normaliseBox(shape) },
+                origPoints: isPolygon(shape) ? shape.points.map((point) => [...point]) : null,
             };
             canvas.setPointerCapture(event.pointerId);
             return;
         }
 
-        // 在空白处拖拽 → 新建框
-        const start = screenToImg(pos.x, pos.y);
+        // 在空白处拖拽 → 新建矩形框
         const classId = defaultClassId();
         state.drag = {
             type: 'new',
-            start,
+            start: imagePoint,
             before: snapshot(),
             temp: {
-                x1: start.x,
-                y1: start.y,
-                x2: start.x,
-                y2: start.y,
+                x1: imagePoint.x,
+                y1: imagePoint.y,
+                x2: imagePoint.x,
+                y2: imagePoint.y,
                 class_id: classId,
                 class_name: classNameOf(classId),
                 confidence: 1,
@@ -502,10 +735,14 @@
     }
 
     function onPointerMove(event) {
+        const pos = pointerPos(event);
         if (!state.drag) {
+            if (state.tool === 'polygon' && state.draft) {
+                state.hoverPoint = screenToImg(pos.x, pos.y);
+                draw();
+            }
             return;
         }
-        const pos = pointerPos(event);
         const img = screenToImg(pos.x, pos.y);
         const iw = imageWidth();
         const ih = imageHeight();
@@ -525,9 +762,49 @@
             return;
         }
 
+        if (drag.type === 'vertex') {
+            const shape = state.annotation.boxes[drag.index];
+            if (!isPolygon(shape)) {
+                return;
+            }
+            const points = shape.points.map((point, index) =>
+                index === drag.vertex
+                    ? [clamp(img.x, 0, iw), clamp(img.y, 0, ih)]
+                    : point
+            );
+            state.annotation.boxes[drag.index] = { ...shape, points, ...boundsOf(points) };
+            draw();
+            return;
+        }
+
         if (drag.type === 'move') {
             const dx = img.x - drag.start.x;
             const dy = img.y - drag.start.y;
+
+            if (drag.origPoints) {
+                const bounds = boundsOf(drag.origPoints);
+                const width = bounds.x2 - bounds.x1;
+                const height = bounds.y2 - bounds.y1;
+                const offsetX = clamp(
+                    dx,
+                    -bounds.x1,
+                    Math.max(0, iw - width) - bounds.x1
+                );
+                const offsetY = clamp(
+                    dy,
+                    -bounds.y1,
+                    Math.max(0, ih - height) - bounds.y1
+                );
+                const points = drag.origPoints.map(([x, y]) => [x + offsetX, y + offsetY]);
+                state.annotation.boxes[drag.index] = {
+                    ...state.annotation.boxes[drag.index],
+                    points,
+                    ...boundsOf(points),
+                };
+                draw();
+                return;
+            }
+
             const width = drag.orig.x2 - drag.orig.x1;
             const height = drag.orig.y2 - drag.orig.y1;
             const x1 = clamp(drag.orig.x1 + dx, 0, Math.max(0, iw - width));
@@ -583,7 +860,11 @@
                 state.selected = state.annotation.boxes.length - 1;
                 commitChange(drag.before);
             }
-        } else if (drag.type === 'move' || drag.type === 'resize') {
+        } else if (
+            drag.type === 'move' ||
+            drag.type === 'resize' ||
+            drag.type === 'vertex'
+        ) {
             const box = normaliseBox(state.annotation.boxes[drag.index]);
             state.annotation.boxes[drag.index] = box;
             commitChange(drag.before);
@@ -628,6 +909,154 @@
             return ids[0];
         }
         return boxes.length ? Number(boxes[boxes.length - 1].class_id) : 0;
+    }
+
+    function round1(value) {
+        return Math.round(value * 10) / 10;
+    }
+
+    // ---------------------------------------------------------------- 多边形 / SAM
+
+    const TOOL_HINTS = {
+        box: '拖空白处画框 · 拖动框移动 · 空格或中键平移 · 滚轮缩放',
+        polygon: '单击加点 · 点回首点或双击闭合 · Alt+点击顶点删除 · Esc 取消',
+        sam: '点一下目标，SAM 自动出轮廓 · 首次使用会下载约 40 MB 模型',
+    };
+
+    function makePolygonShape(points, classId) {
+        return {
+            ...boundsOf(points),
+            points,
+            class_id: classId,
+            class_name: classNameOf(classId),
+            confidence: 1,
+            shape: 'polygon',
+        };
+    }
+
+    function startDraft(point) {
+        state.draft = {
+            points: [[clamp(point.x, 0, imageWidth()), clamp(point.y, 0, imageHeight())]],
+        };
+        state.hoverPoint = { ...point };
+        state.selected = -1;
+        draw();
+        refreshBoxPanel();
+    }
+
+    function addDraftPoint(point) {
+        if (!state.draft) {
+            return;
+        }
+        state.draft.points.push([
+            clamp(point.x, 0, imageWidth()),
+            clamp(point.y, 0, imageHeight()),
+        ]);
+        state.hoverPoint = { ...point };
+        draw();
+    }
+
+    function closeDraft() {
+        if (!state.draft || state.draft.points.length < 3) {
+            state.draft = null;
+            state.hoverPoint = null;
+            draw();
+            return;
+        }
+        const points = state.draft.points.map(([x, y]) => [round1(x), round1(y)]);
+        const before = snapshot();
+        state.annotation.boxes.push(makePolygonShape(points, defaultClassId()));
+        state.selected = state.annotation.boxes.length - 1;
+        state.draft = null;
+        state.hoverPoint = null;
+        commitChange(before);
+        draw();
+        refreshBoxPanel();
+    }
+
+    function cancelDraft() {
+        if (!state.draft) {
+            return;
+        }
+        state.draft = null;
+        state.hoverPoint = null;
+        draw();
+    }
+
+    function removeVertex(index, vertex) {
+        const shape = state.annotation.boxes[index];
+        if (!isPolygon(shape)) {
+            return;
+        }
+        if (shape.points.length <= 3) {
+            toast('多边形至少保留 3 个顶点，整体删除请按 Delete', 'info');
+            return;
+        }
+        const before = snapshot();
+        const points = shape.points.filter((_, position) => position !== vertex);
+        state.annotation.boxes[index] = { ...shape, points, ...boundsOf(points) };
+        commitChange(before);
+        draw();
+        refreshBoxPanel();
+    }
+
+    async function samSegment(point) {
+        if (!state.current || state.samBusy) {
+            return;
+        }
+        if (!state.samReady) {
+            toast('首次使用 SAM 会下载约 40 MB 模型，请稍候…', 'info', 6000);
+        }
+
+        state.samBusy = true;
+        viewport.classList.add('sam-busy');
+        try {
+            const payload = await api('/api/sam', jsonRequest({
+                filename: state.current,
+                points: [[round1(point.x), round1(point.y)]],
+                labels: [1],
+            }));
+            state.samReady = true;
+
+            const polygons = payload.polygons || [];
+            if (!polygons.length) {
+                toast('这个位置没识别出目标，换个点试试', 'info');
+                return;
+            }
+
+            const classId = defaultClassId();
+            const before = snapshot();
+            polygons.forEach((polygon) => {
+                const points = polygon.map(([x, y]) => [round1(x), round1(y)]);
+                if (points.length >= 3) {
+                    state.annotation.boxes.push(makePolygonShape(points, classId));
+                }
+            });
+            state.selected = state.annotation.boxes.length - 1;
+            commitChange(before);
+            draw();
+            refreshBoxPanel();
+            toast(`已生成 ${polygons.length} 个轮廓`, 'success');
+        } catch (error) {
+            toast(`SAM 失败：${error.message}`, 'error', 7000);
+        } finally {
+            state.samBusy = false;
+            viewport.classList.remove('sam-busy');
+        }
+    }
+
+    function setTool(tool) {
+        state.tool = tool;
+        if (tool !== 'polygon') {
+            cancelDraft();
+        }
+        document.querySelectorAll('.tool-btn').forEach((button) => {
+            button.classList.toggle('active', button.dataset.tool === tool);
+        });
+        viewport.classList.toggle('tool-polygon', tool === 'polygon');
+        viewport.classList.toggle('tool-sam', tool === 'sam');
+        $('toolHint').textContent = TOOL_HINTS[tool] || TOOL_HINTS.box;
+        draw();
     }
 
     // ---------------------------------------------------------------- 标注框列表
@@ -716,9 +1145,10 @@
 
             const coord = document.createElement('div');
             coord.className = 'box-coord';
-            coord.textContent =
-                `x ${Math.round(box.x1)}–${Math.round(box.x2)} · ` +
-                `y ${Math.round(box.y1)}–${Math.round(box.y2)}`;
+            coord.textContent = isPolygon(box)
+                ? `${box.points.length} 个顶点 · x ${Math.round(box.x1)}–${Math.round(box.x2)}`
+                : `x ${Math.round(box.x1)}–${Math.round(box.x2)} · ` +
+                  `y ${Math.round(box.y1)}–${Math.round(box.y2)}`;
 
             main.appendChild(title);
             main.appendChild(coord);
@@ -907,6 +1337,8 @@
             state.selected = -1;
             state.history = [];
             state.future = [];
+            state.draft = null;
+            state.hoverPoint = null;
             fitView();
             refreshBoxPanel();
             setSaveState('—', '');
@@ -1463,12 +1895,31 @@
                 }
                 break;
             case 'Escape':
+                cancelDraft();
                 state.selected = -1;
                 draw();
                 refreshBoxPanel();
                 $('exportModal').classList.add('hidden');
                 $('helpModal').classList.add('hidden');
                 $('videoModal').classList.add('hidden');
+                break;
+            case 'Enter':
+                if (state.draft) {
+                    event.preventDefault();
+                    closeDraft();
+                }
+                break;
+            case 'b':
+            case 'B':
+                setTool('box');
+                break;
+            case 'p':
+            case 'P':
+                setTool('polygon');
+                break;
+            case 's':
+            case 'S':
+                setTool('sam');
                 break;
             case 'ArrowLeft':
             case 'ArrowRight':
@@ -1698,6 +2149,16 @@
         canvas.addEventListener('pointercancel', onPointerUp);
         canvas.addEventListener('wheel', onWheel, { passive: false });
         canvas.addEventListener('contextmenu', (event) => event.preventDefault());
+        canvas.addEventListener('dblclick', (event) => {
+            if (state.tool === 'polygon' && state.draft) {
+                event.preventDefault();
+                closeDraft();
+            }
+        });
+
+        document.querySelectorAll('.tool-btn').forEach((button) => {
+            button.addEventListener('click', () => setTool(button.dataset.tool));
+        });
 
         document.addEventListener('keydown', onKeyDown);
         document.addEventListener('keyup', onKeyUp);
@@ -1774,8 +2235,16 @@
 
         bindEvents();
         renderExportFormats();
+        setTool('box');
         resizeCanvas();
         refreshBoxPanel();
+
+        try {
+            const samStatus = await api('/api/sam/status');
+            state.samReady = Boolean(samStatus && samStatus.loaded);
+        } catch (error) {
+            state.samReady = false;
+        }
 
         try {
             await refreshModels();

@@ -107,33 +107,96 @@ def unique_path(folder: Path, filename: str) -> Path:
     raise StorageError(f"同名文件过多: {filename}")
 
 
+MIN_POLYGON_POINTS = 3
+MAX_POLYGON_POINTS = 400
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def normalise_points(
+    raw_points: Any, img_w: float, img_h: float
+) -> list[list[float]] | None:
+    """校验多边形顶点：裁剪到图像范围、去掉相邻重复点；少于 3 点返回 None。"""
+    if not isinstance(raw_points, (list, tuple)):
+        return None
+
+    points: list[list[float]] = []
+    for pair in raw_points:
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            x = float(pair[0])
+            y = float(pair[1])
+        except (TypeError, ValueError):
+            continue
+
+        if img_w > 0:
+            x = _clamp(x, 0.0, img_w)
+        if img_h > 0:
+            y = _clamp(y, 0.0, img_h)
+        if points and abs(points[-1][0] - x) < 0.5 and abs(points[-1][1] - y) < 0.5:
+            continue
+        points.append([round(x, 2), round(y, 2)])
+
+    # 首尾重合时去掉最后一个点（前端闭合时常见）
+    if (
+        len(points) > 1
+        and abs(points[0][0] - points[-1][0]) < 0.5
+        and abs(points[0][1] - points[-1][1]) < 0.5
+    ):
+        points.pop()
+
+    if len(points) < MIN_POLYGON_POINTS:
+        return None
+
+    # 点太多会让 JSON、画布和导出都变慢，等间隔抽样到上限
+    if len(points) > MAX_POLYGON_POINTS:
+        step = len(points) / MAX_POLYGON_POINTS
+        points = [points[int(index * step)] for index in range(MAX_POLYGON_POINTS)]
+    return points
+
+
 def _normalise_box(raw: Any, img_w: float, img_h: float) -> dict | None:
-    """校验并裁剪一个检测框；坐标非法/退化则返回 None。"""
+    """校验并裁剪一个标注形状（矩形框或多边形）；非法则返回 None。
+
+    多边形同样会算出外接矩形，这样检测格式导出、按框排序等旧逻辑不用改。
+    """
     if not isinstance(raw, dict):
         return None
-    try:
-        x1 = float(raw["x1"])
-        y1 = float(raw["y1"])
-        x2 = float(raw["x2"])
-        y2 = float(raw["y2"])
-    except (KeyError, TypeError, ValueError):
-        return None
 
-    if x1 > x2:
-        x1, x2 = x2, x1
-    if y1 > y2:
-        y1, y2 = y2, y1
-    if img_w > 0:
-        x1 = min(max(x1, 0.0), img_w)
-        x2 = min(max(x2, 0.0), img_w)
-    if img_h > 0:
-        y1 = min(max(y1, 0.0), img_h)
-        y2 = min(max(y2, 0.0), img_h)
-    if x2 - x1 < 1 or y2 - y1 < 1:
-        return None
+    points = normalise_points(raw.get("points"), img_w, img_h)
+    if points:
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            return None
+    else:
+        try:
+            x1 = float(raw["x1"])
+            y1 = float(raw["y1"])
+            x2 = float(raw["x2"])
+            y2 = float(raw["y2"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+        if img_w > 0:
+            x1 = _clamp(x1, 0.0, img_w)
+            x2 = _clamp(x2, 0.0, img_w)
+        if img_h > 0:
+            y1 = _clamp(y1, 0.0, img_h)
+            y2 = _clamp(y2, 0.0, img_h)
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            return None
 
     try:
-        confidence = min(max(float(raw.get("confidence", 1.0)), 0.0), 1.0)
+        confidence = _clamp(float(raw.get("confidence", 1.0)), 0.0, 1.0)
     except (TypeError, ValueError):
         confidence = 1.0
     try:
@@ -141,7 +204,7 @@ def _normalise_box(raw: Any, img_w: float, img_h: float) -> dict | None:
     except (TypeError, ValueError):
         class_id = 0
 
-    return {
+    shape = {
         "x1": round(x1, 2),
         "y1": round(y1, 2),
         "x2": round(x2, 2),
@@ -149,7 +212,11 @@ def _normalise_box(raw: Any, img_w: float, img_h: float) -> dict | None:
         "confidence": round(confidence, 4),
         "class_id": max(class_id, 0),
         "class_name": str(raw.get("class_name") or f"class_{class_id}"),
+        "shape": "polygon" if points else "box",
     }
+    if points:
+        shape["points"] = points
+    return shape
 
 
 class AnnotationStore:
