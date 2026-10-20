@@ -1081,6 +1081,7 @@
         host.innerHTML = '';
         const boxes = state.annotation.boxes;
 
+        renderClassOptions();
         $('boxCount').textContent = `${boxes.length} 个框`;
 
         if (!boxes.length) {
@@ -1113,33 +1114,32 @@
             title.className = 'box-title';
 
             if (index === state.selected) {
-                const select = document.createElement('select');
-                Object.keys(state.classes)
-                    .map(Number)
-                    .sort((a, b) => a - b)
-                    .forEach((classId) => {
-                        const option = document.createElement('option');
-                        option.value = String(classId);
-                        option.textContent = `${classId} · ${classNameOf(classId)}`;
-                        if (Number(box.class_id) === classId) {
-                            option.selected = true;
-                        }
-                        select.appendChild(option);
-                    });
-                if (!Object.keys(state.classes).length) {
-                    const option = document.createElement('option');
-                    option.textContent = box.class_name;
-                    select.appendChild(option);
-                }
-                select.addEventListener('change', () => {
-                    const before = snapshot();
-                    const classId = Number(select.value);
-                    state.annotation.boxes[index].class_id = classId;
-                    state.annotation.boxes[index].class_name = classNameOf(classId);
-                    commitChange(before);
-                    draw();
+                // 用「可输入的类别框」而不是 <select>：
+                // 1) <select> 的原生下拉会被整行重绘立刻销毁，点开就没了；
+                // 2) 没加载模型时 select 里只有当前这一项，根本无从切换。
+                const input = document.createElement('input');
+                input.className = 'class-input';
+                input.type = 'text';
+                input.setAttribute('list', 'classOptions');
+                input.value = box.class_name || classNameOf(box.class_id);
+                input.title = '输入或选择类别名，回车确认；输新名字会自动新建类别';
+
+                const stop = (event) => event.stopPropagation();
+                input.addEventListener('pointerdown', stop);
+                input.addEventListener('click', stop);
+                input.addEventListener('keydown', (event) => {
+                    event.stopPropagation();
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        input.blur();
+                    } else if (event.key === 'Escape') {
+                        input.value = box.class_name || classNameOf(box.class_id);
+                        input.blur();
+                    }
                 });
-                title.appendChild(select);
+                input.addEventListener('change', () => applyClassName(index, input));
+                input.addEventListener('blur', () => applyClassName(index, input));
+                title.appendChild(input);
             } else {
                 const name = document.createElement('span');
                 name.textContent = box.class_name || classNameOf(box.class_id);
@@ -1175,9 +1175,76 @@
             row.appendChild(swatch);
             row.appendChild(main);
             row.appendChild(remove);
-            row.addEventListener('click', () => selectBox(index));
+            row.addEventListener('click', (event) => {
+                // 点输入框/按钮时不要触发整行重绘，否则正在编辑的控件会被销毁
+                if (event.target.closest('input, select, button')) {
+                    return;
+                }
+                selectBox(index);
+            });
 
             host.appendChild(row);
+        });
+    }
+
+    function nextClassId() {
+        const ids = Object.keys(state.classes).map(Number);
+        const used = state.annotation.boxes.map((box) => Number(box.class_id));
+        const max = Math.max(-1, ...ids, ...used.filter((id) => Number.isFinite(id)));
+        return max + 1;
+    }
+
+    /** 把输入框里的类别名应用到某个框；名字不存在就新建一个类别 id。 */
+    function applyClassName(index, input) {
+        const box = state.annotation.boxes[index];
+        if (!box) {
+            return;
+        }
+
+        const name = input.value.trim();
+        const currentName = box.class_name || classNameOf(box.class_id);
+        if (!name) {
+            input.value = currentName;
+            return;
+        }
+
+        let classId = Object.keys(state.classes).find((id) => state.classes[id] === name);
+        if (classId === undefined) {
+            const sameName = state.annotation.boxes.find((item) => item.class_name === name);
+            classId = sameName ? String(sameName.class_id) : String(nextClassId());
+            state.classes[classId] = name;
+            renderClassList();
+        }
+
+        if (Number(classId) === Number(box.class_id) && name === currentName) {
+            return;
+        }
+
+        const before = snapshot();
+        state.annotation.boxes[index].class_id = Number(classId);
+        state.annotation.boxes[index].class_name = name;
+        commitChange(before);
+        draw();
+        refreshBoxPanel();
+    }
+
+    function renderClassOptions() {
+        const host = $('classOptions');
+        if (!host) {
+            return;
+        }
+        const names = new Set(Object.values(state.classes));
+        state.annotation.boxes.forEach((box) => {
+            if (box.class_name) {
+                names.add(box.class_name);
+            }
+        });
+
+        host.innerHTML = '';
+        [...names].sort((a, b) => a.localeCompare(b, 'zh-CN')).forEach((name) => {
+            const option = document.createElement('option');
+            option.value = name;
+            host.appendChild(option);
         });
     }
 
